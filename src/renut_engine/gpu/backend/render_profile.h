@@ -79,6 +79,10 @@ void CountTextureUpload(bool async = false);
 // For the spike log: milliseconds the render thread spent finishing the
 // texture upload thread's reads at a submission (UploadThread::Finish).
 void AddTextureFillWait(double ms);
+// For the spike log: milliseconds spent creating a host texture (Create in
+// textures.cpp), and vertex streams converted at a flush.
+void AddTextureCreate(double ms);
+void CountStreamConversions(uint32_t count);
 
 // The render thread finished a frame, busy for 'busy_ms' (its waits left out):
 // adds it, and logs the report when it is due.

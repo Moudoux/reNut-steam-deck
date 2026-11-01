@@ -629,9 +629,25 @@ uint32_t ExtraLevels(RenderScale scale) {
 
 // swap_red_blue: the content was stored with X and Z exchanged. host_levels: a
 // color resolve destination, given extra_levels when it is a scaled 2D one.
+bool CreateUntimed(HostTexture &t, const TextureFetch &fetch, bool render_target,
+                   plume::RenderFormat rt_format, bool swap_red_blue, RenderScale scale,
+                   bool host_levels);
+
 bool Create(HostTexture &t, const TextureFetch &fetch, bool render_target,
             plume::RenderFormat rt_format, bool swap_red_blue = false, RenderScale scale = {},
             bool host_levels = false) {
+  if (!render_profile::Enabled())
+    return CreateUntimed(t, fetch, render_target, rt_format, swap_red_blue, scale, host_levels);
+  const auto start = std::chrono::steady_clock::now();
+  const bool created = CreateUntimed(t, fetch, render_target, rt_format, swap_red_blue, scale, host_levels);
+  render_profile::AddTextureCreate(
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+  return created;
+}
+
+bool CreateUntimed(HostTexture &t, const TextureFetch &fetch, bool render_target,
+                   plume::RenderFormat rt_format, bool swap_red_blue, RenderScale scale,
+                   bool host_levels) {
   u32 width, height, depth;
   fetch.Size(width, height, depth);
   t.dimension = HostDimension(fetch);
