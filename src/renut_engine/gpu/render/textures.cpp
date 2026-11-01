@@ -13,6 +13,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
@@ -123,6 +124,21 @@ BindMemo *BindMemoSet(u32 texture_va, const u32 device[6]) {
 // looked (NoteTextureUnlocked; any thread, hence the lock of its own).
 std::mutex g_unlocked_mutex;
 std::vector<u32> g_unlocked;
+// Textures unlocked while they had no host texture, and lock-driven ones
+// evicted: a host texture made for one later starts lock-driven
+// (RefreshLinearLocked). N&B fills its font cache (1920x1920, 7 MB) at a load,
+// before anything binds it, and cached every glyph the hub needs: no unlock
+// came after its first bind, and it was hashed whole at every frame that drew
+// text (4 MB a frame, ~3.6% of the render thread, 2026-11-01). Cleared when
+// it grows past kUnlockedEarlyMax (a texture then starts as before).
+std::unordered_set<u32> g_unlocked_early;
+constexpr size_t kUnlockedEarlyMax = 4096;
+
+void NoteUnlockedEarly(u32 va) {
+  if (g_unlocked_early.size() >= kUnlockedEarlyMax)
+    g_unlocked_early.clear();
+  g_unlocked_early.insert(va);
+}
 
 // The bindless table filling up (past kEvictPressureSlots of its slots), or
 // video memory nearing the budget the OS gives the process (past
@@ -872,8 +888,20 @@ HostTexture *ResolveTarget(u32 texture_va, plume::RenderFormat format, RenderSca
 
 namespace {
 
+// renut_render_profile: what RefreshLinearLocked hashed, by texture, logged
+// every kLinearStatFrames (LogLinearStatsLocked).
+struct LinearStat {
+  uint64_t bytes = 0;
+  uint32_t hashes = 0, changes = 0, uploads = 0, unlocks = 0;
+  uint32_t width = 0, height = 0, format = 0;
+  bool lock_driven = false, dynamic = false;
+};
+std::unordered_map<u32, LinearStat> g_linear_stats;
+constexpr uint64_t kLinearStatFrames = 600;
+
 // Marks the host textures of the resources unlocked since the last call.
-// Unlocks of anything else (vertex buffers, textures never bound) are dropped.
+// Textures with no host texture yet are remembered (g_unlocked_early); unlocks
+// of anything else (vertex buffers) are dropped.
 void ApplyUnlocksLocked() {
   std::vector<u32> unlocked;
   {
@@ -888,6 +916,12 @@ void ApplyUnlocksLocked() {
       it->second->unlocked = true;
       it->second->unlock_frame = g_frame;
       it->second->lock_driven = true;
+      if (render_profile::Enabled())
+        ++g_linear_stats[va].unlocks;
+    } else if (const auto *resource = GuestPtr<const d3d::Resource>(va);
+               resource && (u32(resource->Common) & d3d::kCommonTypeMask) ==
+                               u32(d3d::ResourceType::Texture)) {
+      NoteUnlockedEarly(va);
     }
   }
 }
@@ -902,7 +936,8 @@ void ApplyUnlocksLocked() {
 // - Lock-driven: the game writes it between a Lock and D3D::UnlockResource
 //   (the font cache, sub_82B8F848). An unlock uploads; the content is watched
 //   for kUnlockWatchFrames after one, and checked every kLinearVerifyFrames
-//   for a write that went around the unlock (which ends lock-driven).
+//   for a write that went around the unlock (which ends lock-driven). A
+//   texture unlocked before it was first bound starts so (g_unlocked_early).
 // - Dynamic: changed at kDynamicChanges checks in a row (the XMV logo movies,
 //   whose decoder writes without a Lock and may still be writing at the
 //   draw). Uploaded every frame; checked every kLinearVerifyFrames for having
@@ -911,20 +946,38 @@ void ApplyUnlocksLocked() {
 // A write after the check shows the next frame.
 void RefreshLinearLocked(HostTexture &t, const TextureFetch &fetch) {
   ApplyUnlocksLocked();
+  LinearStat *stat = nullptr;
+  if (render_profile::Enabled()) {
+    stat = &g_linear_stats[t.guest_va];
+    stat->width = t.width;
+    stat->height = t.height;
+    stat->format = u32(t.guest_format);
+  }
+  auto hash_content = [&] {
+    const uint64_t hash = ContentHash(fetch, t);
+    if (stat) {
+      stat->bytes += uint64_t(t.sample_sizes[0]) + t.sample_sizes[1];
+      ++stat->hashes;
+      stat->changes += hash != t.content_hash;
+    }
+    return hash;
+  };
   auto upload = [&](uint64_t hash) {
     t.content_hash = hash;
     t.uploaded = Upload(t, fetch, ReadAt::kSubmit);
+    if (stat)
+      ++stat->uploads;
   };
   const bool verify_due = g_frame - t.verified_frame >= kLinearVerifyFrames;
   if (!t.uploaded) {
-    upload(ContentHash(fetch, t));
+    upload(hash_content());
     t.verified_frame = g_frame;
   } else if (t.lock_driven) {
     const bool watched = g_frame - t.unlock_frame < kUnlockWatchFrames;
     if (t.unlocked) {
-      upload(ContentHash(fetch, t));
+      upload(hash_content());
     } else if (watched || verify_due) {
-      const uint64_t hash = ContentHash(fetch, t);
+      const uint64_t hash = hash_content();
       if (hash != t.content_hash) {
         upload(hash);
         t.lock_driven = watched;
@@ -934,7 +987,7 @@ void RefreshLinearLocked(HostTexture &t, const TextureFetch &fetch) {
     }
   } else if (t.dynamic) {
     if (verify_due) {
-      const uint64_t hash = ContentHash(fetch, t);
+      const uint64_t hash = hash_content();
       t.dynamic = hash != t.content_hash;
       t.changes = 0;
       t.content_hash = hash;
@@ -942,7 +995,7 @@ void RefreshLinearLocked(HostTexture &t, const TextureFetch &fetch) {
     }
     t.uploaded = Upload(t, fetch, ReadAt::kSubmit);
   } else {
-    const uint64_t hash = ContentHash(fetch, t);
+    const uint64_t hash = hash_content();
     if (hash != t.content_hash) {
       upload(hash);
       t.dynamic = ++t.changes >= kDynamicChanges;
@@ -952,6 +1005,38 @@ void RefreshLinearLocked(HostTexture &t, const TextureFetch &fetch) {
     }
   }
   t.unlocked = false;
+  if (stat) {
+    stat->lock_driven = t.lock_driven;
+    stat->dynamic = t.dynamic;
+  }
+}
+
+// The linear textures RefreshLinearLocked hashed most since the last log.
+void LogLinearStatsLocked() {
+  if (g_linear_stats.empty())
+    return;
+  std::vector<std::pair<u32, LinearStat>> stats(g_linear_stats.begin(), g_linear_stats.end());
+  g_linear_stats.clear();
+  uint64_t bytes = 0, hashes = 0;
+  for (const auto &[va, stat] : stats) {
+    bytes += stat.bytes;
+    hashes += stat.hashes;
+  }
+  std::sort(stats.begin(), stats.end(),
+            [](const auto &a, const auto &b) { return a.second.bytes > b.second.bytes; });
+  std::string lines;
+  for (size_t i = 0; i < std::min<size_t>(stats.size(), 8); ++i) {
+    const auto &[va, st] = stats[i];
+    lines += fmt::format("\n  {:08X} format {} {}x{}: {:.3f} MB per frame, {} hashes, {} changed, "
+                         "{} uploads, {} unlocks{}{}",
+                         va, st.format, st.width, st.height,
+                         double(st.bytes) / kLinearStatFrames / (1 << 20), st.hashes, st.changes,
+                         st.uploads, st.unlocks, st.lock_driven ? ", lock-driven" : "",
+                         st.dynamic ? ", dynamic" : "");
+  }
+  RGPU_INFO("Linear textures: {} checked, {:.0f} hashes and {:.2f} MB hashed per frame{}",
+            stats.size(), double(hashes) / kLinearStatFrames,
+            double(bytes) / kLinearStatFrames / (1 << 20), lines);
 }
 
 // The backstop (kEvictPressureSlots, kEvictMemoryShare): with the bindless
@@ -973,8 +1058,11 @@ void EvictIdleTexturesLocked() {
     if (!t || g_frame - t->used_frame >= limit)
       idle.push_back(va);
   }
-  for (u32 va : idle)
+  for (u32 va : idle) {
+    if (const HostTexture *t = FindHostTextureLocked(va); t && t->lock_driven)
+      NoteUnlockedEarly(va);
     ReleaseHostTextureLocked(va);
+  }
   if (slots) {
     RGPU_WARN("Textures: bindless table nearly full; {} idle host textures released ({} of {} "
               "slots in use)",
@@ -994,6 +1082,8 @@ void AdvanceTextureFrameLocked() {
   ApplyUnlocksLocked();
   if (g_frame % kEvictCheckFrames == 0)
     EvictIdleTexturesLocked();
+  if (g_frame % kLinearStatFrames == 0)
+    LogLinearStatsLocked();
 }
 
 void ReleaseHostTexturesInMemoryLocked(u32 physical, u32 size) {
@@ -1138,6 +1228,10 @@ TextureBinding BindUncached(u32 texture_va, const TextureFetch &device_fetch,
       }
       Retire(*slot);
       return binding;  // keep the entry so it is not retried every draw
+    }
+    if (g_unlocked_early.erase(texture_va)) {
+      slot->lock_driven = true;
+      slot->unlock_frame = g_frame;
     }
   }
   HostTexture &t = *slot;
