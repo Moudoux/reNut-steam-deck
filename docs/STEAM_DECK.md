@@ -49,6 +49,26 @@ Add `upstream` once: `git remote add upstream https://github.com/masterspike52/r
 Re-running it is the incremental build. `deck/build.sh --shell` opens a shell
 in the container with the same mounts.
 
+### Profile-guided build (PGO)
+
+The build compiles with `deck/renut.profdata`, a profile of what runs most in
+a play session on the Deck (clang `-fprofile-use`; a change of flags
+reconfigures and rebuilds everything). Made 2026-11-01 from ~4 minutes of
+the hub, a world and driving.
+
+- Render thread, hub: 2.75–2.88 → 2.47–2.64 µs per draw; the area after it
+  3.39–3.95 → 3.20–3.69. The GPU is unchanged.
+- Code changed since the profile is compiled as without one. Make it again
+  after large changes (an upstream rebase, say):
+  1. `deck/build.sh --pgo-generate`: an instrumented build in
+     `out/build/linux-amd64-release-pgo-generate`.
+  2. `APPIMAGE=out/build/linux-amd64-release-pgo-generate/renut-x86_64.AppImage deck/deploy.sh`,
+     then play 5–10 minutes (it runs slower). It writes `/tmp/renut-pgo/` on
+     the Deck every 30 s (`src/renut_engine/perf/pgo_dump.cpp`), since Steam
+     kills the game rather than letting it exit.
+  3. `deck/build.sh --pgo-merge` copies it into `out/pgo/` and merges it into
+     `deck/renut.profdata`; then `deck/build.sh` and `deck/deploy.sh`.
+
 - **Image kept current:** the image carries a hash of `deck/Dockerfile`
   (label `renut.dockerfile`) and is rebuilt when the file changes. An image
   built before the Dockerfile gained `libtbb-dev` had been reused, and
@@ -115,6 +135,9 @@ reNut rewrites `renut.toml` on exit: edit it only while the game is closed.
   had an empty `thirdparty/plume`); `ignore = dirty` on XenosRecomp, which
   `build.sh` patches.
 - `version.txt` (`0.0.0`): CMake reads it and upstream doesn't commit it.
+- PGO: `deck/renut.profdata`, `build.sh --pgo-generate` / `--pgo-merge`,
+  `deploy.sh`'s `APPIMAGE` override, `src/renut_engine/perf/pgo_dump.cpp`
+  (see [Profile-guided build](#profile-guided-build-pgo)).
 
 ### XenosRecomp (`deck/xenosrecomp-deck.patch`)
 
@@ -390,5 +413,4 @@ the same day (perf over a hub → workshop → hub round trip, and the logs).
 
 - The render thread's remaining per-draw cost is spread out: texture
   binding ~15%, `DrawNeedsExportFlush` ~12%, `UploadFloatConstants` ~6%.
-- Profile-guided optimisation (PGO) from a Deck play session.
 - Send the XenosRecomp and SDK fixes upstream.
