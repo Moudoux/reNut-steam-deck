@@ -1,3 +1,8 @@
 [submodule "thirdparty/reblue-XenosRecomp"]
 	path = thirdparty/reblue-XenosRecomp
 	url = https://github.com/masterspike52/reblue-XenosRecomp.git
+	# deck/build.sh patches it and puts Microsoft's DXC in it.
+	ignore = dirty
+[submodule "thirdparty/plume"]
+	path = thirdparty/plume
+	url = https://github.com/renderbag/plume.git

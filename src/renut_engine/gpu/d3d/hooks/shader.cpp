@@ -85,7 +85,22 @@ ShaderMemoSet &ShaderMemoSetFor(u32 kind_index, u32 shader_va) {
 // shaders, and this is one compare where the memo is a cache miss.
 ShaderMemo g_last_shader[2];
 
+// The shader each lookup (by count, per kind) found last frame: draws come in
+// the same order every frame, and this list is read in order where the memo's
+// sets are a random line each. A forgotten shader ends the generation, so no
+// prediction outlives its record.
+struct ShaderPrediction {
+  u32 va = 0;
+  ShaderRecord *record = nullptr;
+  uint64_t generation = 0;
+};
+constexpr size_t kMaxShaderPredictions = 1u << 16;
+std::vector<ShaderPrediction> g_shader_predicted[2];
+size_t g_shader_ordinal[2] = {};
+uint64_t g_shader_generation = 1;
+
 void ForgetShader(u32 shader_va) {
+  ++g_shader_generation;
   for (u32 kind = 0; kind < 2; ++kind) {
     for (ShaderMemo &memo : ShaderMemoSetFor(kind, shader_va).way) {
       if (memo.va == shader_va)
@@ -100,10 +115,36 @@ void ForgetShader(u32 shader_va) {
 
 namespace renut::gpu {
 
+namespace {
+ShaderRecord *FindShaderUnpredicted(u32 shader_va, RecordKind kind, u32 kind_index);
+}  // namespace
+
 ShaderRecord *FindShaderLocked(u32 shader_va, RecordKind kind) {
   if (!shader_va)
     return nullptr;
   const u32 kind_index = KindIndex(kind);
+  std::vector<ShaderPrediction> &predicted = g_shader_predicted[kind_index];
+  const size_t n = g_shader_ordinal[kind_index]++;
+  if (n < predicted.size()) {
+    const ShaderPrediction &p = predicted[n];
+    if (p.va == shader_va && p.generation == g_shader_generation)
+      return p.record;
+  }
+  ShaderRecord *record = FindShaderUnpredicted(shader_va, kind, kind_index);
+  if (n < kMaxShaderPredictions) {
+    if (n >= predicted.size())
+      predicted.resize(n + 1);
+    predicted[n] = {shader_va, record, g_shader_generation};
+  }
+  return record;
+}
+
+void NextShaderFrameLocked() {
+  g_shader_ordinal[0] = g_shader_ordinal[1] = 0;
+}
+
+namespace {
+ShaderRecord *FindShaderUnpredicted(u32 shader_va, RecordKind kind, u32 kind_index) {
   ShaderMemo &last = g_last_shader[kind_index];
   if (last.va == shader_va)
     return last.record;
@@ -129,6 +170,7 @@ ShaderRecord *FindShaderLocked(u32 shader_va, RecordKind kind) {
   last = found;
   return found.record;
 }
+}  // namespace
 
 void ReleaseGuestShaderLocked(u32 shader_va) {
   if (g_guest_shaders.erase(shader_va))
@@ -138,6 +180,13 @@ void ReleaseGuestShaderLocked(u32 shader_va) {
 void BuildDeclarationLayout(VertexDeclarationRecord &declaration) {
   declaration.layout =
       BuildHostVertexLayout(declaration.elements.data(), u32(declaration.elements.size()));
+  // Each draw asks which streams the declaration reads: once here, not by
+  // byte-swapping every element per draw.
+  declaration.stream_mask = 0;
+  for (const GuestVertexElement &e : declaration.elements) {
+    if (const u32 stream = u16(e.Stream); stream < 32)
+      declaration.stream_mask |= 1u << stream;
+  }
   // FNV-1a over what the input layout depends on.
   uint64_t hash = 0xCBF29CE484222325ull;
   auto mix = [&hash](uint64_t v) { hash = (hash ^ v) * 0x100000001B3ull; };

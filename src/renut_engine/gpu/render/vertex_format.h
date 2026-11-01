@@ -95,6 +95,7 @@ struct HostVertexStream {
 // input location are dropped (no N&B shader reads them).
 struct HostVertexLayout {
   HostVertexStream streams[kMaxVertexStreams];
+  u32 used_mask = 0;  // bit n: streams[n].used (draws walk these, not all 16)
   std::vector<plume::RenderInputElement> input_elements;  // semantic names are static strings
 };
 

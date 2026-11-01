@@ -30,6 +30,7 @@ struct VertexDeclarationRecord {
   std::vector<GuestVertexElement> elements;  // without D3DDECL_END
   HostVertexLayout layout;
   uint64_t layout_hash = 0;  // identifies the host input layout for pipeline keys
+  u32 stream_mask = 0;       // bit n: an element reads vertex stream n (below 32)
 };
 
 struct ShaderRecord {
@@ -66,6 +67,9 @@ struct ShaderRecord {
 // side of a guest object set up in place (XGRegisterVertexShader/PixelShader).
 // nullptr if it is neither. Requires State().mutex.
 ShaderRecord *FindShaderLocked(u32 shader_va, RecordKind kind);
+
+// A new frame's shader lookups begin (FindShaderLocked's prediction).
+void NextShaderFrameLocked();
 
 // Drops the host side of an in-place guest shader object, if it has one.
 // Requires State().mutex.

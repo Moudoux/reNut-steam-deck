@@ -17,6 +17,10 @@
 REXCVAR_DEFINE_DOUBLE(renut_render_profile, 0.0, "Nuts&Bolts/Debug",
                       "Every this many seconds, log the render thread's CPU time per frame by "
                       "stage of the work (what the overlay's Render is spent on). 0: off.");
+REXCVAR_DEFINE_BOOL(renut_render_profile_stages, true, "Nuts&Bolts/Debug",
+                    "With renut_render_profile: time each stage of every draw. Off logs only the "
+                    "busy time and draws per frame, which costs next to nothing (for comparing "
+                    "builds).");
 
 namespace renut::gpu::render_profile {
 
@@ -44,6 +48,10 @@ static_assert(std::size(kStageNames) == size_t(Stage::kCount));
 std::array<Clock::duration, size_t(Stage::kCount)> g_stages{};
 uint64_t g_draws = 0;
 uint64_t g_frames = 0;
+// This frame's, for the spike log.
+uint32_t g_frame_draws = 0, g_frame_builds = 0, g_frame_uploads = 0;
+uint32_t g_spikes_logged = 0;
+Clock::time_point g_spike_window = Clock::now();
 double g_busy_ms = 0.0;
 double g_recorder_ms = 0.0;
 Clock::time_point g_since = Clock::now();
@@ -64,12 +72,15 @@ void Report() {
     if (ms >= 0.005)
       lines += fmt::format("\n  {:7.3f} ms  {}", ms, kStageNames[i]);
   }
-  lines += fmt::format("\n  {:7.3f} ms  the rest (present, uploads, other work)", std::max(0.0, busy - counted));
+  if (counted > 0.0)
+    lines += fmt::format("\n  {:7.3f} ms  the rest (present, uploads, other work)", std::max(0.0, busy - counted));
   // Beside it, not part of it (renut_threaded_recording).
   if (g_recorder_ms > 0.0)
     lines += fmt::format("\n  recording thread: {:.3f} ms per frame of host API calls", g_recorder_ms / frames);
-  RGPU_INFO("Render thread profile: {:.3f} ms busy per frame over {} frames, {:.0f} draws per frame{}",
-            busy, g_frames, double(g_draws) / frames, lines);
+  const double draws = double(g_draws) / frames;
+  RGPU_INFO("Render thread profile: {:.3f} ms busy per frame over {} frames, {:.0f} draws per frame "
+            "({:.2f} us per draw){}",
+            busy, g_frames, draws, draws > 0.0 ? 1000.0 * busy / draws : 0.0, lines);
   g_stages = {};
   g_draws = 0;
   g_frames = 0;
@@ -83,7 +94,13 @@ bool Enabled() {
   return REXCVAR_GET(renut_render_profile) > 0.0;
 }
 
-Scope::Scope(Stage stage) : stage_(stage), active_(Enabled()) {
+namespace {
+bool StagesEnabled() {
+  return Enabled() && REXCVAR_GET(renut_render_profile_stages);
+}
+}  // namespace
+
+Scope::Scope(Stage stage) : stage_(stage), active_(StagesEnabled()) {
   if (active_)
     start_ = Clock::now();
 }
@@ -93,7 +110,7 @@ Scope::~Scope() {
     g_stages[size_t(stage_)] += Clock::now() - start_;
 }
 
-Stages::Stages() : active_(Enabled()) {}
+Stages::Stages() : active_(StagesEnabled()) {}
 
 Stages::~Stages() {
   if (timing_)
@@ -117,8 +134,20 @@ void Stages::Enter(Stage stage) {
 }
 
 void CountDraw() {
-  if (Enabled())
+  if (Enabled()) {
     ++g_draws;
+    ++g_frame_draws;
+  }
+}
+
+void CountPipelineBuild() {
+  if (Enabled())
+    ++g_frame_builds;
+}
+
+void CountTextureUpload() {
+  if (Enabled())
+    ++g_frame_uploads;
 }
 
 void FrameDone(double busy_ms) {
@@ -130,6 +159,21 @@ void FrameDone(double busy_ms) {
   }
   ++g_frames;
   g_busy_ms += busy_ms;
+  // A frame the render thread could not finish within a 60 Hz refresh, with
+  // what it did that a usual frame does not (at most 30 a minute).
+  constexpr double kSpikeMs = 1000.0 / 60.0;
+  if (busy_ms > kSpikeMs) {
+    const Clock::time_point now = Clock::now();
+    if (now - g_spike_window > std::chrono::minutes(1)) {
+      g_spike_window = now;
+      g_spikes_logged = 0;
+    }
+    if (g_spikes_logged++ < 30) {
+      RGPU_INFO("Render thread spike: {:.1f} ms, {} draws, {} pipelines built, {} textures uploaded",
+                busy_ms, g_frame_draws, g_frame_builds, g_frame_uploads);
+    }
+  }
+  g_frame_draws = g_frame_builds = g_frame_uploads = 0;
   g_recorder_ms += recorder_ms;
   if (Clock::now() - g_since >= std::chrono::duration<double>(interval)) {
     Report();

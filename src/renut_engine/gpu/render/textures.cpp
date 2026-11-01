@@ -15,6 +15,7 @@
 
 #include "renut_engine/gpu/backend/backend.h"
 #include "renut_engine/gpu/backend/gpu_profile.h"
+#include "renut_engine/gpu/backend/render_profile.h"
 #include "renut_engine/gpu/d3d/d3d.h"
 #include "renut_engine/gpu/guest/guest_memory.h"
 #include "renut_engine/gpu/log.h"
@@ -397,6 +398,7 @@ bool Upload(HostTexture &t, const TextureFetch &fetch, bool defer_read) {
 
   auto &s = State();
   plume::RenderCommandList *cmd = s.command_list;
+  render_profile::CountTextureUpload();
   static const uint32_t kProfileLabel = gpu_profile::Label("texture uploads");
   gpu_profile::Mark(s, kProfileLabel);
   cmd->barriers(plume::RenderBarrierStage::COPY,

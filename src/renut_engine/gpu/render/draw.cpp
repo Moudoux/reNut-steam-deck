@@ -577,7 +577,46 @@ public:
   }
 
   // The map's entry for 'key', made if 'make' (else null when it has none).
+  // First the entry this frame's same lookup (by count) had last frame, or the
+  // next one's when this frame has one lookup fewer so far: the draws come in
+  // the same order frame after frame, and that list is read in order, where
+  // the slots are a random line each (two cache misses a lookup were an eighth
+  // of the render thread, 2026-11-01 Deck trace).
   Entry *Get(Map &map, const typename Map::key_type &key, bool make) {
+    const size_t n = ordinal_;
+    if (n < predicted_.size()) {
+      if (Entry *p = predicted_[n]; p && p->first == key) {
+        ordinal_ = n + 1;
+        return p;
+      }
+      if (n + 1 < predicted_.size()) {
+        if (Entry *p = predicted_[n + 1]; p && p->first == key) {
+          ordinal_ = n + 2;
+          return p;
+        }
+      }
+    }
+    Entry *entry = Lookup(map, key, make);
+    if (n < kMaxPredicted) {
+      if (n >= predicted_.size())
+        predicted_.resize(n + 1, nullptr);
+      predicted_[n] = entry;
+    }
+    ordinal_ = n + 1;
+    return entry;
+  }
+
+  // A new frame's lookups begin (AdvanceStreamCacheFrameLocked).
+  void NextFrame() { ordinal_ = 0; }
+
+  void Clear() {
+    std::fill(std::begin(slots_), std::end(slots_), Slot{});
+    predicted_.clear();
+    ordinal_ = 0;
+  }
+
+private:
+  Entry *Lookup(Map &map, const typename Map::key_type &key, bool make) {
     const size_t hash = Hash{}(key);
     if (Entry *entry = Find(key, hash))
       return entry;
@@ -593,9 +632,7 @@ public:
     return &*it;
   }
 
-  void Clear() { std::fill(std::begin(slots_), std::end(slots_), Slot{}); }
-
-private:
+  static constexpr size_t kMaxPredicted = 1u << 16;
   struct Slot {
     size_t hash = 0;
     Entry *entry = nullptr;
@@ -604,6 +641,8 @@ private:
     return u32((uint64_t(hash) * 0x9E3779B97F4A7C15ull) >> (64 - kBits));
   }
   alignas(32) Slot slots_[2u << kBits];
+  std::vector<Entry *> predicted_;  // last frame's entry per lookup, in order
+  size_t ordinal_ = 0;              // this frame's lookups so far
 };
 
 struct CachedStream {
@@ -1849,10 +1888,9 @@ bool BindStreams(const GuestDevice &device, const DrawCall &call, const ShaderRe
                  const u32 *shader_strides, const HostVertexLayout &layout, uint64_t layout_hash,
                  const Geometry &g, const GpuStreams &gpu_streams) {
   plume::RenderCommandList *cmd = State().command_list;
-  for (u32 stream = 0; stream < kMaxVertexStreams; ++stream) {
+  for (u32 bits = layout.used_mask; bits; bits &= bits - 1) {
+    const u32 stream = u32(std::countr_zero(bits));
     const HostVertexStream &hs = layout.streams[stream];
-    if (!hs.used)
-      continue;
     if (gpu_streams.bytes[stream]) {
       const plume::RenderVertexBufferView view(gpu_streams.ref[stream], gpu_streams.bytes[stream]);
       const plume::RenderInputSlot slot(
@@ -2588,12 +2626,10 @@ ExportRead DrawNeedsExportFlush(const GuestDevice &device, const DrawCall &call,
     slots = found_slots;
     return read;
   };
-  u32 streams_checked = 0;
-  for (const GuestVertexElement &e : declaration.elements) {
-    const u32 stream = u16(e.Stream);
-    if (stream >= kMaxVertexStreams || (streams_checked & (1u << stream)))
-      continue;
-    streams_checked |= 1u << stream;
+  for (u32 bits = declaration.stream_mask; bits; bits &= bits - 1) {
+    const u32 stream = u32(std::countr_zero(bits));
+    if (stream >= kMaxVertexStreams)
+      break;
     // A Begin/DrawVerticesUP draw's stream 0 is its own vertices, whatever
     // buffer the fetch constant still names: nothing of it is read from
     // memory.
@@ -2942,9 +2978,8 @@ bool ConvertExportedStreamsLocked(VideoState &s, const GuestDevice &device, cons
   // pending nearly always, and for most draws none is (the jobs below are
   // big to set up).
   u32 pending = 0;
-  for (u32 stream = 0; stream < kMaxVertexStreams; ++stream) {
-    if (!declaration.layout.streams[stream].used)
-      continue;
+  for (u32 bits = declaration.layout.used_mask; bits; bits &= bits - 1) {
+    const u32 stream = u32(std::countr_zero(bits));
     const u32 fetch_index = d3d::kFirstVertexFetchIndex + d3d::StreamFetchIndex(stream);
     const u32 base = device.VertexFetchWord(fetch_index, 0) & ~3u;
     const u32 size = device.VertexFetchWord(fetch_index, 1) & 0x3FFFFFCu;
@@ -3404,6 +3439,28 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   stages.Enter(render_profile::Stage::kTargets);
   if (!BindTargets(targets))
     return false;
+  if (gpu_profile::DrawsActive(s)) {
+    // renut_gpu_profile_draws: the target's kind, split by the draw's shaders.
+    struct LabelKey {
+      uint32_t target;
+      uint64_t vs, ps;
+      bool operator==(const LabelKey &) const = default;
+    };
+    struct LabelKeyHash {
+      size_t operator()(const LabelKey &k) const {
+        return std::hash<uint64_t>()(k.vs * 31 + k.ps) ^ k.target;
+      }
+    };
+    static std::unordered_map<LabelKey, uint32_t, LabelKeyHash> labels;
+    const uint32_t target = TargetsProfileLabel(targets);
+    const LabelKey lk{target, vs->hash, ps ? ps->hash : 0};
+    auto it = labels.find(lk);
+    if (it == labels.end()) {
+      it = labels.emplace(lk, gpu_profile::Label(fmt::format("vs {:016X} ps {:016X} ({})", lk.vs,
+                                                                lk.ps, target))).first;
+    }
+    gpu_profile::MarkDraw(s, it->second);
+  }
   stages.Enter(render_profile::Stage::kRecord);
   plume::RenderCommandList *cmd = s.command_list;
   SetViewport(cmd, viewport.viewport, viewport.scissor, targets.color_count);
@@ -3515,6 +3572,10 @@ void ForgetVertexDeclarationLocked(u32 declaration_va) {
 }
 
 void AdvanceStreamCacheFrameLocked() {
+  NextShaderFrameLocked();
+  g_stream_memo.NextFrame();
+  g_index_memo.NextFrame();
+  g_fetch_memo.NextFrame();
   // Copies whose guest bytes changed (ContentVerifier), unless made again
   // since they were checked.
   static std::vector<decltype(g_stream_verifier)::Check> stale;
@@ -3568,30 +3629,34 @@ void AdvanceStreamCacheFrameLocked() {
   }
   stale_fetches.clear();
 
-  if (++g_stream_cache_frame % 60)
-    return;
-  // The memos may hold entries about to go.
-  g_stream_memo.Clear();
-  g_index_memo.Clear();
-  g_fetch_memo.Clear();
-  std::erase_if(g_fetch_cache, [](auto &entry) {
-    if (g_stream_cache_frame - entry.second.last_used < kStreamCacheIdleFrames)
-      return false;
-    DropCachedFetch(entry.second);
-    return true;
-  });
-  std::erase_if(g_stream_cache, [](auto &entry) {
-    if (g_stream_cache_frame - entry.second.last_used < kStreamCacheIdleFrames)
-      return false;
-    DropCachedCopy(entry.second);
-    return true;
-  });
-  std::erase_if(g_index_cache, [](auto &entry) {
-    if (g_stream_cache_frame - entry.second.last_used < kStreamCacheIdleFrames)
-      return false;
-    DropCachedIndices(entry.second);
-    return true;
-  });
+  // Each map is swept for entries idle a minute every 600 frames, the three
+  // 200 frames apart: a sweep walks every node (cache misses each), and all
+  // three every 60 frames was a frame over budget each second on the Deck
+  // (2026-11-01). A memo is cleared only when its map lost entries (it may
+  // hold them): clearing every sweep left the next frame to look every key up
+  // cold.
+  const uint64_t phase = ++g_stream_cache_frame % 600;
+  if (phase == 0 && std::erase_if(g_fetch_cache, [](auto &entry) {
+        if (g_stream_cache_frame - entry.second.last_used < kStreamCacheIdleFrames)
+          return false;
+        DropCachedFetch(entry.second);
+        return true;
+      }))
+    g_fetch_memo.Clear();
+  if (phase == 200 && std::erase_if(g_stream_cache, [](auto &entry) {
+        if (g_stream_cache_frame - entry.second.last_used < kStreamCacheIdleFrames)
+          return false;
+        DropCachedCopy(entry.second);
+        return true;
+      }))
+    g_stream_memo.Clear();
+  if (phase == 400 && std::erase_if(g_index_cache, [](auto &entry) {
+        if (g_stream_cache_frame - entry.second.last_used < kStreamCacheIdleFrames)
+          return false;
+        DropCachedIndices(entry.second);
+        return true;
+      }))
+    g_index_memo.Clear();
 }
 
 StreamCacheMemory StreamCacheMemoryLocked() {

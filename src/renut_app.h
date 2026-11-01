@@ -20,6 +20,9 @@
 #include "renut_engine/game/keyboard_input.h"
 #include "renut_engine/game/graphics_menu.h"
 #include <rex/ui/window.h>
+#if !defined(_WIN32)
+#include <SDL3/SDL_hints.h>
+#endif
 #include <rex/ui/overlay/achievement_notification.h>
 //#include <rex/discord_rpc.h>
 #include <atomic>
@@ -52,6 +55,11 @@ public:
 
     static std::unique_ptr<rex::ui::WindowedApp> Create(
         rex::ui::WindowedAppContext& ctx) {
+#if !defined(_WIN32)
+        // The overlay keeps SDL's text input on for its text fields, which on a
+        // Steam Deck pops Steam's on-screen keyboard up at launch.
+        SDL_SetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD, "0");
+#endif
         return std::unique_ptr<RenutApp>(new RenutApp(ctx, "renut", PPCImageConfig));
     }
 
