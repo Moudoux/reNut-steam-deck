@@ -1,104 +1,120 @@
 /**
  * @file    gpu/render/frame_order.h
- * @brief   Last frame's lookups, in order, to predict this frame's.
+ * @brief   The last frames' lookups, in order, to predict this frame's.
  */
 #pragma once
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <optional>
+#include <utility>
 #include <vector>
 
 namespace renut::gpu {
 
 struct FrameOrderStats {
-  uint64_t hits = 0;     // last frame's item at the point
+  uint64_t hits = 0;     // last frame's item at its point
+  uint64_t older = 0;    // the frame before's at its point (not last frame's)
   uint64_t resyncs = 0;  // found further on, past a stretch this frame skipped
-  uint64_t misses = 0;   // not among the next kSeek of last frame's
+  uint64_t misses = 0;   // in neither frame's next kSeek
+  // Of the lookups not predicted, for callers that count them:
+  uint64_t made = 0;    // a new entry made
+  uint64_t absent = 0;  // nothing found (and none made)
 };
 
 // The draws come in the same order frame after frame, so a lookup's result is
 // most likely what the same point of last frame's sequence found, and that
-// list is read in order where a hash table is a random line each. The point
-// in last frame's sequence is kept apart from this frame's count: when the
-// camera moves, objects come into view (lookups last frame did not have) and
-// go out of it (lookups it had) mid-frame. Keeping one count for both, a
-// single new object left every later prediction one off, and the rest of the
-// frame missed (render thread 2.6 us per draw standing in the hub, 3.0-4.4
-// moving, 2026-11-01). Now a lookup last frame did not have leaves the point
-// where it is, and a skipped stretch is found again by a scan of the next
-// kSeek items. Predictions are always checked by the caller: a wrong one
-// costs time, never a wrong result.
+// list is read in order where a hash table is a random line each.
+//
+// - Each frame's point is kept apart from this frame's count: when the camera
+//   moves, objects come into view (lookups last frame did not have) and go out
+//   of it (lookups it had) mid-frame. With one count for both, a single new
+//   object left every later prediction one off, and the rest of the frame
+//   missed (render thread 2.6 us per draw standing in the hub, 3.0-4.4
+//   moving, 2026-11-01). A result a frame did not have leaves its point where
+//   it is; one found within its next kSeek items moves the point past it.
+// - The frame before last is kept too, for data the game may write to two
+//   buffers in turn: the vertex fetch lookups were ~99% misses against last
+//   frame alone, with every key one an earlier frame had.
+//
+// Predictions are always checked by the caller: a wrong one costs time, never
+// a wrong result. T's == says whether two results are the same one.
 template <typename T>
 class FrameOrder {
 public:
   static constexpr size_t kSeek = 32;
 
-  // Last frame's item 'ahead' places past the point, or null past its end.
-  const T *Peek(size_t ahead = 0) const {
-    const size_t i = cursor_ + ahead;
-    return i < prev_.size() ? &prev_[i] : nullptr;
-  }
-
-  // How far past the point the first of the next kSeek items 'match' accepts
-  // is, if any.
+  // The first item 'match' accepts at the frames' points or less than 'reach'
+  // past them, last frame's first; null if none.
   template <typename Match>
-  std::optional<size_t> Seek(Match &&match) const {
-    const size_t end = std::min(prev_.size(), cursor_ + kSeek);
-    for (size_t i = cursor_; i < end; ++i) {
-      if (match(prev_[i]))
-        return i - cursor_;
+  const T *Find(size_t reach, Match &&match) const {
+    for (const History &h : history_) {
+      const size_t end = std::min(h.items.size(), h.point + reach);
+      for (size_t i = h.point; i < end; ++i) {
+        if (match(h.items[i]))
+          return &h.items[i];
+      }
     }
-    return std::nullopt;
+    return nullptr;
   }
 
-  // This lookup is last frame's item 'ahead' places on, found as 'item' (that
-  // item, or a fresher result for the same key): carry on after it.
-  void Take(size_t ahead, const T &item) {
-    Record(item);
-    cursor_ += ahead + 1;
-    ++(ahead ? stats_.resyncs : stats_.hits);
-  }
-
-  // A lookup last frame's sequence did not have here: the point stays.
-  void Add(const T &item) {
-    Record(item);
-    ++stats_.misses;
-  }
-
-  // A new frame's lookups begin: this frame's sequence is next frame's
-  // prediction.
-  void NextFrame() {
-    prev_.swap(cur_);
-    cur_.clear();
-    cursor_ = 0;
-  }
-
-  // Forgets both frames' items (the entries they point to may be gone).
-  void Clear() {
-    prev_.clear();
-    cur_.clear();
-    cursor_ = 0;
-  }
-
-  FrameOrderStats TakeStats() {
-    const FrameOrderStats s = stats_;
-    stats_ = {};
-    return s;
-  }
-
-private:
-  static constexpr size_t kMaxItems = 1u << 16;
-
+  // This lookup's result: each frame whose next kSeek items have it carries on
+  // after it.
   void Record(const T &item) {
+    bool found = false;
+    bool at_point[2] = {};
+    for (size_t k = 0; k < 2; ++k) {
+      History &h = history_[k];
+      const size_t end = std::min(h.items.size(), h.point + kSeek);
+      for (size_t i = h.point; i < end; ++i) {
+        if (h.items[i] == item) {
+          found = true;
+          at_point[k] = i == h.point;
+          h.point = i + 1;
+          break;
+        }
+      }
+    }
+    if (at_point[0])
+      ++stats_.hits;
+    else if (at_point[1])
+      ++stats_.older;
+    else if (found)
+      ++stats_.resyncs;
+    else
+      ++stats_.misses;
     if (cur_.size() < kMaxItems)
       cur_.push_back(item);
   }
 
-  std::vector<T> prev_;  // last frame's results, in order
-  std::vector<T> cur_;   // this frame's so far
-  size_t cursor_ = 0;    // the point in prev_ this frame's lookups have reached
+  // A new frame's lookups begin: this frame's are the last frame's.
+  void NextFrame() {
+    std::swap(history_[1].items, history_[0].items);
+    std::swap(history_[0].items, cur_);
+    cur_.clear();
+    history_[0].point = history_[1].point = 0;
+  }
+
+  // Forgets every frame's items (what they point to may be gone).
+  void Clear() {
+    for (History &h : history_) {
+      h.items.clear();
+      h.point = 0;
+    }
+    cur_.clear();
+  }
+
+  FrameOrderStats TakeStats() { return std::exchange(stats_, {}); }
+
+private:
+  static constexpr size_t kMaxItems = 1u << 16;
+
+  struct History {
+    std::vector<T> items;  // that frame's results, in order
+    size_t point = 0;      // how far this frame's lookups have come in them
+  };
+  History history_[2];  // last frame's, the frame before's
+  std::vector<T> cur_;  // this frame's so far
   FrameOrderStats stats_;
 };
 
