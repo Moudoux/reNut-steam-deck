@@ -26,6 +26,9 @@ struct GpuProfileSettings final : rex::SettingOwner {
   REX_SETTING(f64, renut_gpu_profile, 0.0,
               "Every this many seconds, log the GPU's time per frame by kind of work "
               "(draws per target, resolves, mip levels, present). 0 = off.");
+  REX_SETTING(bool, renut_gpu_profile_draws, false,
+              "With renut_gpu_profile: split draws by their shaders too (a timestamp per "
+              "draw, so the profile itself costs GPU time).");
 };
 GpuProfileSettings &g_gpu_profile_settings = *new GpuProfileSettings();  // never freed, registered by RenutApp::OnConfigure
 }  // namespace
@@ -35,8 +38,10 @@ namespace renut::gpu::gpu_profile {
 namespace {
 
 // Timestamps one frame may write; past them its work stays with the last
-// kind marked.
-constexpr uint32_t kMaxMarks = 2048;
+// kind marked. Per-draw marks need many more, but Vulkan has every query of the
+// pool written each frame (EndList), so the pool is only that large then.
+constexpr uint32_t kMaxMarks = 16384;
+constexpr uint32_t kKindMarks = 2048;
 constexpr uint32_t kEndOfList = 0;  // a list's last timestamp: no span follows
 constexpr uint32_t kOther = 1;      // a list's start, before any kind is marked
 
@@ -44,6 +49,7 @@ struct Slot {
   std::unique_ptr<plume::RenderQueryPool> pool;
   bool open = false;    // the slot's frame has begun recording
   bool active = false;  // ... and is profiled
+  uint32_t capacity = 0;  // the pool's queries
   uint32_t count = 0;
   uint32_t list = 0;
   uint32_t current = kEndOfList;
@@ -55,8 +61,9 @@ std::array<Slot, kFramesInFlight> g_slots;
 std::vector<std::string> g_names = {"(list end)", "other"};
 std::unordered_map<std::string, uint32_t> g_ids = {{"(list end)", kEndOfList}, {"other", kOther}};
 
-// Since the last report: GPU nanoseconds per kind, and frames.
+// Since the last report: GPU nanoseconds and draws per kind, and frames.
 std::vector<uint64_t> g_totals;
+std::vector<uint64_t> g_draws;
 uint64_t g_frames = 0;
 std::chrono::steady_clock::time_point g_last_report = std::chrono::steady_clock::now();
 
@@ -85,12 +92,16 @@ void Report(double interval) {
   const double per_frame = 1e6 * double(g_frames);
   std::string lines;
   for (size_t i = 0; i < kinds.size() && i < 24; ++i) {
-    lines += std::format("\n  {:7.3f} ms  {}", double(kinds[i].first) / per_frame,
-                         g_names[kinds[i].second]);
+    const uint32_t id = kinds[i].second;
+    const uint64_t draws = id < g_draws.size() ? g_draws[id] : 0;
+    lines += std::format("\n  {:7.3f} ms  {}", double(kinds[i].first) / per_frame, g_names[id]);
+    if (draws)
+      lines += std::format("  ({:.1f} draws)", double(draws) / double(g_frames));
   }
   RGPU_INFO("GPU profile: {:.3f} ms per frame over {} frames{}", double(total) / per_frame,
             g_frames, lines);
   std::fill(g_totals.begin(), g_totals.end(), 0);
+  std::fill(g_draws.begin(), g_draws.end(), 0);
   g_frames = 0;
 }
 
@@ -108,9 +119,23 @@ uint32_t Label(std::string_view name) {
 
 void Mark(VideoState &s, uint32_t label) {
   Slot &slot = g_slots[s.frame];
-  if (!slot.active || !s.command_list || label == slot.current || slot.count + 2 >= kMaxMarks)
+  if (!slot.active || !s.command_list || label == slot.current || slot.count + 2 >= slot.capacity)
     return;
   Write(s, slot, label);
+}
+
+bool DrawsActive(VideoState &s) {
+  return g_gpu_profile_settings.renut_gpu_profile_draws.Get() && g_slots[s.frame].active;
+}
+
+void MarkDraw(VideoState &s, uint32_t label) {
+  Slot &slot = g_slots[s.frame];
+  if (!slot.active)
+    return;
+  Mark(s, label);
+  if (g_draws.size() <= label)
+    g_draws.resize(g_names.size());
+  ++g_draws[label];
 }
 
 void BeginList(VideoState &s) {
@@ -120,15 +145,17 @@ void BeginList(VideoState &s) {
     slot.count = 0;
     slot.list = 0;
     slot.active = g_gpu_profile_settings.renut_gpu_profile.Get() > 0.0 && s.device->getCapabilities().queryPools;
-    if (slot.active && !slot.pool) {
-      slot.pool = s.device->createQueryPool(kMaxMarks);
+    const uint32_t capacity = g_gpu_profile_settings.renut_gpu_profile_draws.Get() ? kMaxMarks : kKindMarks;
+    if (slot.active && (!slot.pool || slot.capacity != capacity)) {
+      slot.pool = s.device->createQueryPool(capacity);
+      slot.capacity = slot.pool ? capacity : 0;
       slot.active = slot.pool != nullptr;
     }
     // Vulkan queries are reset before they are written again.
     if (slot.active)
-      s.command_list->resetQueryPool(slot.pool.get(), 0, kMaxMarks);
+      s.command_list->resetQueryPool(slot.pool.get(), 0, slot.capacity);
   }
-  if (slot.active && slot.count + 2 < kMaxMarks)
+  if (slot.active && slot.count + 2 < slot.capacity)
     Write(s, slot, kOther);
 }
 
@@ -136,12 +163,12 @@ void EndList(VideoState &s, bool last_in_frame) {
   Slot &slot = g_slots[s.frame];
   if (!slot.active || !s.command_list)
     return;
-  if (slot.count < kMaxMarks)
+  if (slot.count < slot.capacity)
     Write(s, slot, kEndOfList);
   ++slot.list;
   // Vulkan returns no results while any query of the pool is unwritten.
   if (last_in_frame && IsVulkan()) {
-    for (uint32_t i = slot.count; i < kMaxMarks; ++i)
+    for (uint32_t i = slot.count; i < slot.capacity; ++i)
       s.command_list->writeTimestamp(slot.pool.get(), i);
   }
 }

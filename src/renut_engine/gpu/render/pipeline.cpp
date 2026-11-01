@@ -35,6 +35,7 @@
 #include "renut_engine/app/app_paths.h"
 #include "renut_engine/app/renut_settings.h"
 #include "renut_engine/gpu/backend/backend.h"
+#include "renut_engine/gpu/backend/render_profile.h"
 #include "renut_engine/gpu/render/format.h"
 #include "renut_engine/gpu/render/graphics_options.h"
 #include "renut_engine/gpu/guest/guest_memory.h"
@@ -365,6 +366,7 @@ std::vector<std::unique_ptr<Job>> BuiltInJobs() {
     HostVertexLayout &layout = g_built_in_layouts[i];
     for (u32 s = 0; s < kMaxVertexStreams; ++s) {
       layout.streams[s].used = (in.used_streams >> s) & 1;
+      layout.used_mask |= u32(layout.streams[s].used) << s;
       layout.streams[s].host_stride = in.strides[s];
     }
     for (u32 e = 0; e < in.element_count; ++e) {
@@ -656,6 +658,7 @@ plume::RenderPipeline *GetPipelineLocked(const PipelineKey &key, const PipelineI
   std::unique_ptr<plume::RenderPipeline> pipeline;
   bool claimed = false;
   if (!TakePrebuilt(key, hash, pipeline, claimed)) {
+    render_profile::CountPipelineBuild();
     pipeline = Build(key, inputs);
     if (pipeline && !claimed)
       g_capture.Add(key, *inputs.layout);

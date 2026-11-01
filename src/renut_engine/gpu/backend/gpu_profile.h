@@ -27,6 +27,11 @@ uint32_t Label(std::string_view name);
 // Work recorded from here on in the open command list is 'label''s.
 void Mark(VideoState &s, uint32_t label);
 
+// renut_gpu_profile_draws: whether draws are split by shader in this frame,
+// and a draw's work from here on is 'label''s (counted as one draw).
+bool DrawsActive(VideoState &s);
+void MarkDraw(VideoState &s, uint32_t label);
+
 // A command list of the frame begins or ends (BeginListTiming,
 // EndListTiming).
 void BeginList(VideoState &s);

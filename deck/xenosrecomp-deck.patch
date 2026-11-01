@@ -1,0 +1,55 @@
+diff --git a/XenosRecomp/CMakeLists.txt b/XenosRecomp/CMakeLists.txt
+index 3fb4933..0273f95 100644
+--- a/XenosRecomp/CMakeLists.txt
++++ b/XenosRecomp/CMakeLists.txt
+@@ -41,6 +41,16 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "Ap
+     endif()
+ endif()
+ 
++# libstdc++ runs std::execution::par_unseq serially unless it is built against TBB.
++if (NOT WIN32 AND NOT LIBCPP)
++    find_package(TBB QUIET)
++    if (TBB_FOUND)
++        target_link_libraries(XenosRecomp PRIVATE TBB::tbb)
++    else()
++        message(WARNING "TBB not found: XenosRecomp will recompile shaders on one thread")
++    endif()
++endif()
++
+ if (WIN32)
+     target_compile_definitions(XenosRecomp PRIVATE _CRT_SECURE_NO_WARNINGS)
+     add_custom_command(TARGET XenosRecomp POST_BUILD
+diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
+index c41e9da..b1c7647 100644
+--- a/XenosRecomp/main.cpp
++++ b/XenosRecomp/main.cpp
+@@ -166,8 +166,17 @@ int main(int argc, char** argv)
+ 
+         std::atomic<uint32_t> progress = 0;
+ 
+-        std::for_each(std::execution::par_unseq, shaders.begin(), shaders.end(), [&](auto& hashShaderPair)
++        // libstdc++ only parallelizes over random-access iterators: a std::map's
++        // would run serially, so iterate pointers to its entries. par, not
++        // par_unseq: the body takes a mutex.
++        std::vector<std::pair<const XXH64_hash_t, RecompiledShader>*> work;
++        work.reserve(shaders.size());
++        for (auto& entry : shaders)
++            work.push_back(&entry);
++
++        std::for_each(std::execution::par, work.begin(), work.end(), [&](auto* entry)
+             {
++                auto& hashShaderPair = *entry;
+                 auto& shader = hashShaderPair.second;
+                 const XXH64_hash_t hash = hashShaderPair.first;
+ 
+@@ -208,7 +217,9 @@ int main(int argc, char** argv)
+                 }
+ #endif
+ 
+-                thread_local DxcCompiler dxcCompiler;
++                // Leaked on purpose: destroying it as a worker thread exits calls into
++                // libdxcompiler after its own thread-local state is gone (a crash).
++                thread_local DxcCompiler& dxcCompiler = *new DxcCompiler;
+ 
+ #ifdef XENOS_RECOMP_DXIL
+                 shader.dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false);
