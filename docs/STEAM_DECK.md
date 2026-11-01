@@ -196,6 +196,18 @@ Result: the shader cache step went from ~30 min on one core to minutes.
     contents or the null texture meanwhile. Textures whose host copy is
     rebuilt (another header over the same memory, say) had no old contents
     and flickered black on the title screen and in the hub.
+- **Font cache checked by its unlocks** (`g_unlocked_early` in
+  `gpu/render/textures.cpp`): a texture unlocked (`D3D::UnlockResource`)
+  before it had a host texture, or a lock-driven one evicted, starts
+  lock-driven when its host texture is made. N&B fills its font cache
+  (1920x1920, ~7 MB) at a load, before anything binds it, and in the hub no
+  glyph was added after: no later unlock made it lock-driven, so it was
+  hashed whole at every frame that drew text. Only resources whose header
+  says texture are remembered (not vertex buffers); the set is cleared past
+  4096 entries.
+  - Measured in the hub: linear textures' hashing went from 4.1–4.4 MB a
+    frame to 0.12–0.18 MB (the font cache: 13 hashes per 600 frames, the
+    30-frame verify, instead of ~350). Text still updates.
 - **Profiling:**
   - `renut_gpu_profile_draws`: splits `renut_gpu_profile` by shader pair,
     with draw counts. The query pool is 16384 only in that mode; at 2048
@@ -207,6 +219,10 @@ Result: the shader cache step went from ~30 min on one core to minutes.
     render-thread work passes 1/60 s logs its ms, draws, pipelines built,
     textures uploaded, how many of those the upload thread read, and the ms
     spent finishing its reads at submission (at most 30 a minute).
+  - **Linear textures:** with `renut_render_profile` on, every 600 frames a
+    `Linear textures:` line: how many were checked, the hashes and MB hashed
+    per frame, and the 8 that cost most, each with its hashes, changes,
+    uploads, unlocks and mode (lock-driven, dynamic).
 
 ### Measured on the Deck (hub, standing, 2026-11-01)
 
@@ -241,6 +257,12 @@ From Mumbo's workshop out to the hub, the same walk before and after:
   - Read: `perf report --children --sort sym -g folded,0,caller,count`.
   - By line: `-F 999` without `-g`, then `--sort srcline`. The build has line
     tables.
+  - By time, for one spike among normal frames: `perf script --inline -F
+    time,ip,sym --time <start>,<end>` and count samples per 100 ms by the
+    functions on their stacks (at 499 Hz a sample is ~2 ms). Busy stretches
+    show where a load ends. Run the awk from a script file copied to the
+    Deck; nested ssh quoting expands its `$` fields locally. `perf report
+    --time <start>,<end>` gives the leaf functions of the same window.
   - Delete the data file afterwards.
 - **Per-thread CPU from `/proc/<pid>/task/*/stat`:** parse after the last
   `) `. Thread names contain spaces.
@@ -263,13 +285,32 @@ On the Deck, after deploying:
 
 ## Next work
 
-- **Arrival frames with new geometry:** after the upload thread, the hub's
-  first frames after a load still take 20–40 ms with 6,000–9,500 draws and
-  no texture wait: the first conversions of the area's vertices and indices.
-  A ~780 ms frame at the end of the workshop's load (9,416 draws, 2 uploads,
-  no pipelines) is not understood yet.
-- **`ContentHash`** of the linear textures was ~3.6% of the render thread
-  walking the hub (perf, 2026-11-01).
+### Tracked frame-time problems
+
+Found measuring the texture upload thread (2026-11-01). Each: what is known,
+how to see it, and what to find out first.
+
+1. **A ~780 ms frame at the end of the workshop's load.** Entering Mumbo's
+   workshop from the hub, after the loading screen: one frame of 779.7 ms
+   with 9,416 draws, 2 textures uploaded, no pipelines built, then 64 ms
+   with 112 uploads (`Render thread spike` lines, 16:06:23). Neither
+   uploads nor pipelines, so its cause is unknown. Behind the loading screen,
+   so it may hardly show. First: perf over the end of that load (start
+   recording before leaving the hub: the last attempt stopped ~3 s early),
+   and see whether it happens on every entry.
+2. **Arrival frames in the hub.** Out of the workshop into the hub, the first
+   frames take 20–40 ms with 6,000–9,500 draws and no texture wait (39.6 ms
+   at 7,384 draws, 28.2 ms at 9,551). A guess, not measured: the first
+   conversions of the area's vertices and indices, and cold caches. This is
+   the hitch still visible on arriving. First: perf bucketed by time over the
+   arrival ([Profiling on the Deck](#profiling-on-the-deck), by time).
+3. **Linear textures' `ContentHash`: fixed.** It was ~3.6% of the render
+   thread walking the hub: nearly all of it the font cache, hashed whole at
+   every frame that drew text (4 MB a frame). See "Font cache checked by its
+   unlocks" above.
+
+### Other
+
 - The render thread's remaining per-draw cost is spread out: texture
   binding ~15%, `DrawNeedsExportFlush` ~12%, `UploadFloatConstants` ~6%.
 - Profile-guided optimisation (PGO) from a Deck play session.
