@@ -24,6 +24,20 @@ const ShaderCacheEntry *FindShaderEntry(uint64_t hash);
 std::unique_ptr<plume::RenderShader> CreateCachedShader(plume::RenderDevice *device,
                                                         const ShaderCacheEntry &entry);
 
+// Host shaders made ahead of their first draw: the game makes its shader
+// objects at a load, and each was decoded and created at its first draw, on
+// the render thread (smolv::Decode in the frames where something came into
+// view: most of what walking about the hub cost over standing, perf on a
+// Steam Deck, 2026-11-01). PrepareCachedShader queues an entry for a thread
+// of its own (any thread); TakeCachedShader gives the shader it made, waits
+// for one it is making, or makes it there and then as CreateCachedShader does
+// (a queued one is taken off the queue). StopShaderPreparer, at shutdown,
+// frees what was made and not taken.
+void PrepareCachedShader(plume::RenderDevice *device, const ShaderCacheEntry *entry);
+std::unique_ptr<plume::RenderShader> TakeCachedShader(plume::RenderDevice *device,
+                                                      const ShaderCacheEntry &entry);
+void StopShaderPreparer();
+
 // For a shader FindShaderEntry did not find (the game compiles a few at
 // runtime, which no dump of its files has): writes its container to the
 // capture directory (renut_shader_capture_dir), named as tools/dump_shaders.py

@@ -14,7 +14,6 @@
  */
 #include <cstring>
 #include <memory>
-#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -94,6 +93,8 @@ struct ShaderPrediction {
   u32 va = 0;
   ShaderRecord *record = nullptr;
   uint64_t generation = 0;
+  // The same lookup (FrameOrder::Record): the same address.
+  bool operator==(const ShaderPrediction &o) const { return va == o.va; }
 };
 FrameOrder<ShaderPrediction> g_shader_order[2];
 uint64_t g_shader_generation = 1;
@@ -123,28 +124,19 @@ ShaderRecord *FindShaderLocked(u32 shader_va, RecordKind kind) {
     return nullptr;
   const u32 kind_index = KindIndex(kind);
   FrameOrder<ShaderPrediction> &order = g_shader_order[kind_index];
-  if (const ShaderPrediction *p = order.Peek();
-      p && p->va == shader_va && p->generation == g_shader_generation) {
-    ShaderRecord *record = p->record;
-    order.Take(0, *p);
-    return record;
+  // The list is the predictions themselves (no record read to check one), so
+  // the whole of FrameOrder's reach is searched.
+  ShaderPrediction found;
+  if (const ShaderPrediction *p =
+          order.Find(FrameOrder<ShaderPrediction>::kSeek, [shader_va](const ShaderPrediction &p) {
+            return p.va == shader_va && p.generation == g_shader_generation;
+          })) {
+    found = *p;
+  } else {
+    found = {shader_va, FindShaderUnpredicted(shader_va, kind, kind_index), g_shader_generation};
   }
-  const std::optional<size_t> ahead =
-      order.Seek([shader_va](const ShaderPrediction &p) { return p.va == shader_va; });
-  if (ahead) {
-    if (const ShaderPrediction *p = order.Peek(*ahead); p->generation == g_shader_generation) {
-      ShaderRecord *record = p->record;
-      order.Take(*ahead, *p);
-      return record;
-    }
-  }
-  ShaderRecord *record = FindShaderUnpredicted(shader_va, kind, kind_index);
-  const ShaderPrediction found{shader_va, record, g_shader_generation};
-  if (ahead)
-    order.Take(*ahead, found);
-  else
-    order.Add(found);
-  return record;
+  order.Record(found);
+  return found.record;
 }
 
 void NextShaderFrameLocked() {
@@ -156,6 +148,7 @@ FrameOrderStats TakeShaderOrderStatsLocked() {
   FrameOrderStats stats = g_shader_order[0].TakeStats();
   const FrameOrderStats pixel = g_shader_order[1].TakeStats();
   stats.hits += pixel.hits;
+  stats.older += pixel.older;
   stats.resyncs += pixel.resyncs;
   stats.misses += pixel.misses;
   return stats;
@@ -264,7 +257,7 @@ plume::RenderShader *GetHostShader(ShaderRecord *shader) {
     return host;
   std::lock_guard lock(shader->host_mutex);
   if (!shader->host) {
-    shader->host = CreateCachedShader(Video::Device(), *shader->entry);
+    shader->host = TakeCachedShader(Video::Device(), *shader->entry);  // PrepareCachedShader
     if (!shader->host) {
       RGPU_ERROR("Creating shader {:016X} failed", shader->hash);
       shader->entry = nullptr;  // don't retry every draw
@@ -324,6 +317,7 @@ u32 CreateShaderRecord(const be_u32 *function, bool pixel) {
   if (!shader->entry)
     CaptureMissingShader(container, pixel, shader->hash);
   PipelineShaderLoaded(shader->entry);
+  PrepareCachedShader(Video::Device(), shader->entry);
   // Draws before it may have found no shader at the address (FindShaderLocked).
   render_thread::Queue([va = shader->self_va] { ForgetShader(va); });
   return shader->self_va;
@@ -372,6 +366,7 @@ void RegisterGuestShader(u32 shader_va, u32 physical_va, bool pixel) {
     shader->hash = hash;
     shader->entry = FindShaderEntry(hash);
     PipelineShaderLoaded(shader->entry);
+    PrepareCachedShader(Video::Device(), shader->entry);
   });
 }
 

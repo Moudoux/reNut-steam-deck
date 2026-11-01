@@ -26,6 +26,7 @@
 #include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/backend/native_window.h"
 #include "renut_engine/gpu/render/pipeline.h"
+#include "renut_engine/gpu/render/shader_library.h"
 #include "renut_engine/gpu/backend/render_thread.h"
 #include "renut_engine/gpu/backend/video_internal.h"
 
@@ -655,6 +656,7 @@ void Video::BeginShutdown() {
   auto &s = State();
   s.shutting_down.store(true, std::memory_order_release);
   StopPipelinePrebuild();
+  StopShaderPreparer();
   render_thread::Stop();
   std::lock_guard lock(s.mutex);
   // The recording thread is done with the lists before they go at exit.

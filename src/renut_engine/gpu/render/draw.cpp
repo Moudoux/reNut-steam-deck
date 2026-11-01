@@ -14,11 +14,13 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <plume_render_interface.h>
 
 #include <fmt/format.h>
+#include <rex/cvar.h>
 #include <xxhash.h>
 
 #include "renut_engine/gpu/backend/backend.h"
@@ -40,6 +42,11 @@
 #include "renut_engine/gpu/render/textures.h"
 #include "renut_engine/gpu/render/vertex_format.h"
 #include "renut_engine/gpu/backend/video_internal.h"
+
+REXCVAR_DEFINE_BOOL(renut_tessellation_per_patch, true, "Nuts&Bolts/Debug",
+                    "Tessellated triangle patches (N&B's water) each at its own level, as on "
+                    "the console. Off draws all of a draw's patches at the highest level any of "
+                    "its edges asks for (several times the vertices). Vulkan.");
 
 namespace renut::gpu {
 
@@ -109,7 +116,9 @@ struct SharedConstants {
   // 1344: in guest pixels, what the pixel position is relative to: a draw
   // predicated to one tile has the tile's corner (ViewportState::pixel_origin).
   float pixel_origin[2];
-  float pad_1352[2];
+  // 1352: triangle patches each at its own level (tessellation[0] 3): the
+  // device address of one entry per instance (PrepareTessellation).
+  uint64_t tessellation_patches;
 };
 static_assert(offsetof(SharedConstants, sampler_indices) == 384);
 static_assert(offsetof(SharedConstants, booleans) == 512);
@@ -127,6 +136,7 @@ static_assert(offsetof(SharedConstants, point_state) == 1312);
 static_assert(offsetof(SharedConstants, viewport_size) == 1328);
 static_assert(offsetof(SharedConstants, resolution_scale) == 1336);
 static_assert(offsetof(SharedConstants, pixel_origin) == 1344);
+static_assert(offsetof(SharedConstants, tessellation_patches) == 1352);
 static_assert(sizeof(SharedConstants) == 1360);
 
 // The guest D3DDevice a draw reads its state from: the live device, or a
@@ -578,25 +588,17 @@ public:
   }
 
   // The map's entry for 'key', made if 'make' (else null when it has none).
-  // First the entry the same point of last frame's lookups had, or the next
-  // one's (FrameOrder): two cache misses a lookup in the slots were an eighth
-  // of the render thread (2026-11-01 Deck trace).
+  // First the entry the same point of the last frames' lookups had, or the
+  // next one's (FrameOrder): two cache misses a lookup in the slots were an
+  // eighth of the render thread (2026-11-01 Deck trace). Further on only by
+  // pointer, in Record: checking a key reads the entry, a cache miss.
   Entry *Get(Map &map, const typename Map::key_type &key, bool make) {
-    for (size_t ahead = 0; ahead < 2; ++ahead) {
-      if (Entry *const *p = order_.Peek(ahead); p && *p && (*p)->first == key) {
-        Entry *entry = *p;
-        order_.Take(ahead, entry);
-        return entry;
-      }
-    }
-    Entry *entry = Lookup(map, key, make);
-    if (entry) {
-      if (auto ahead = order_.Seek([entry](Entry *e) { return e == entry; })) {
-        order_.Take(*ahead, entry);
-        return entry;
-      }
-    }
-    order_.Add(entry);
+    Entry *entry = nullptr;
+    if (Entry *const *p = order_.Find(2, [&key](Entry *e) { return e && e->first == key; }))
+      entry = *p;
+    else
+      entry = Lookup(map, key, make);
+    order_.Record(entry);
     return entry;
   }
 
@@ -608,7 +610,12 @@ public:
     order_.Clear();
   }
 
-  FrameOrderStats TakeStats() { return order_.TakeStats(); }
+  FrameOrderStats TakeStats() {
+    FrameOrderStats stats = order_.TakeStats();
+    stats.made = std::exchange(made_, 0);
+    stats.absent = std::exchange(absent_, 0);
+    return stats;
+  }
 
 private:
   Entry *Lookup(Map &map, const typename Map::key_type &key, bool make) {
@@ -617,9 +624,12 @@ private:
       return entry;
     auto it = map.find(key);
     if (it == map.end()) {
-      if (!make)
+      if (!make) {
+        ++absent_;
         return nullptr;
+      }
       it = map.try_emplace(key).first;
+      ++made_;
     }
     Slot *set = &slots_[SetIndex(hash) * 2];
     set[1] = set[0];
@@ -636,6 +646,7 @@ private:
   }
   alignas(32) Slot slots_[2u << kBits];
   FrameOrder<Entry *> order_;
+  uint64_t made_ = 0, absent_ = 0;  // Lookup's, for the stats
 };
 
 struct CachedStream {
@@ -1499,7 +1510,17 @@ struct Geometry {
   // Tessellated draws: one instance per patch, the streams per instance.
   u32 instance_count = 1;
   bool per_instance = false;
+  // Patches drawn each at its own level: one host draw per level
+  // (g_tessellation_groups).
+  bool patch_levels = false;
 };
+
+// A level's patches in a draw of patches each at its own level: instances
+// [first, first + count) of the patch list (PrepareTessellation).
+struct TessellationGroup {
+  u32 segments, first, count;
+};
+std::vector<TessellationGroup> g_tessellation_groups;
 
 // Reads 'count' guest indices into g_indices.
 bool ReadIndices(const u8 *src, u32 count, bool is32, u32 endian) {
@@ -1752,11 +1773,21 @@ bool PrepareGeometry(const GuestDevice &device, const DrawCall &call, Geometry &
   return true;
 }
 
+// PrepareTessellation's, for the "Tessellation:" line (renut_render_profile).
+struct TessellationStats {
+  uint64_t draws = 0;
+  uint64_t vertices = 0;          // drawn
+  uint64_t adaptive_patches = 0;  // with their own edge factors
+  uint64_t own_vertices = 0;      // those patches, each at its own level
+};
+TessellationStats g_tess_stats;
+
 // Tessellated draws (DrawCall::tessellation): the patches become instances of a
 // grid the vertex shader places (renutVertexRegisters in shader_common.h), at
 // one level for the whole draw, the highest any patch edge asks for.
 bool PrepareTessellation(const GuestDevice &device, const DrawCall &call, Geometry &g,
-                         u32 tessellation[4]) {
+                         SharedConstants &sc, bool patch_levels) {
+  u32 *tessellation = sc.tessellation;
   const bool triangles = call.primitive == kTrianglePatch;
   if (!triangles && call.primitive != kQuadPatch) {
     static uint32_t logged = 0;
@@ -1773,6 +1804,7 @@ bool PrepareTessellation(const GuestDevice &device, const DrawCall &call, Geomet
   // sized 36 bytes x the count it draws, and its factor pass exports one
   // patch's edge factors per invocation.)
   const u32 patches = call.count;
+  bool factors_read = false;  // g_indices holds them
   if ((device.U32(d3d::kDeviceOffsetTessellationControl) & 3) == 2) {
     // Adaptive: the index buffer holds each patch's edge factors (floats), from
     // the start index on. When a memexport draw in flight writes them, these
@@ -1784,6 +1816,7 @@ bool PrepareTessellation(const GuestDevice &device, const DrawCall &call, Geomet
     const u8 *base = ib ? AddressPtr(ib->Address) : nullptr;
     if (base && ReadIndices(base + size_t(call.start_index) * 4, patches * edges, true,
                             d3d::IndexBufferEndian(ib->resource.Common))) {
+      factors_read = true;
       float highest = 0.0f;
       for (u32 bits : g_indices) {
         float factor;
@@ -1802,6 +1835,29 @@ bool PrepareTessellation(const GuestDevice &device, const DrawCall &call, Geomet
   while (segments > 1 &&
          uint64_t(patches) * segments * segments * per_segment > kMaxTessellatedVertices)
     --segments;
+  if (render_profile::Enabled()) {
+    // The vertices each patch at its own highest edge's level would need
+    // (adaptive draws), against these at the draw's: the "Tessellation:" line.
+    g_tess_stats.draws++;
+    g_tess_stats.vertices += uint64_t(patches) * segments * segments * per_segment;
+    if (factors_read) {
+      const u32 edges = triangles ? 3 : 4;
+      for (u32 p = 0; p < patches; ++p) {
+        float highest = 0.0f;
+        for (u32 e = 0; e < edges; ++e) {
+          float factor;
+          std::memcpy(&factor, &g_indices[size_t(p) * edges + e], 4);
+          if (factor > highest && factor < 1024.0f)
+            highest = factor;
+        }
+        const u32 own = std::min(segments, std::clamp(u32(std::ceil(std::clamp(
+                                                          highest + 1.0f, min_level, max_level))),
+                                                      1u, 64u));
+        g_tess_stats.own_vertices += uint64_t(own) * own * per_segment;
+      }
+      g_tess_stats.adaptive_patches += patches;
+    }
+  }
 
   g.vertex_count = segments * segments * per_segment;
   g.instance_count = patches;
@@ -1811,6 +1867,63 @@ bool PrepareTessellation(const GuestDevice &device, const DrawCall &call, Geomet
   tessellation[0] = triangles ? 1 : 2;
   tessellation[1] = segments;
   tessellation[2] = u32(call.base_vertex);
+
+  // Each patch at its own level, its highest edge's (as the console does),
+  // instead of all at the highest any edge of the draw asks for: the hub's
+  // water drew 1,307k vertices a frame, 241k at the patches' own levels, each
+  // through a vertex shader of five texture fetches (3.4 of a 12.9 ms GPU
+  // frame on a Steam Deck, 2026-11-01). Edges keep their own segments
+  // (renutVertexRegisters snaps to them), so neighbours of different levels
+  // meet. Within the draw's vertex cap: 'segments' bounds every level.
+  if (patch_levels && triangles && factors_read) {
+    static std::vector<uint32_t> entries;  // per patch: index, levels (renutVertexRegisters)
+    entries.resize(size_t(patches) * 2);
+    u32 per_level[65] = {};
+    uint64_t own_vertices = 0;
+    auto edge_segments = [&](float factor) {
+      if (!(factor > 0.0f && factor < 1024.0f))
+        factor = 0.0f;
+      return std::min(segments, std::clamp(u32(std::ceil(std::clamp(factor + 1.0f, min_level, max_level))),
+                                            1u, 64u));
+    };
+    for (u32 p = 0; p < patches; ++p) {
+      u32 e[3];
+      for (u32 i = 0; i < 3; ++i) {
+        float factor;
+        std::memcpy(&factor, &g_indices[size_t(p) * 3 + i], 4);
+        e[i] = edge_segments(factor);
+      }
+      const u32 own = std::max({e[0], e[1], e[2]});
+      entries[size_t(p) * 2] = u32(call.base_vertex) + p;
+      entries[size_t(p) * 2 + 1] = own | (e[0] << 8) | (e[1] << 16) | (e[2] << 24);
+      ++per_level[own];
+      own_vertices += uint64_t(own) * own * 3;
+    }
+    // Sorted by level (counting sort), each level one host draw.
+    UploadAllocation alloc = Video::UploadsLocked().Allocate(size_t(patches) * 8, 16);
+    if (alloc && alloc.gpu_address) {
+      u32 start[65];
+      g_tessellation_groups.clear();
+      for (u32 level = 1, first = 0; level <= 64; ++level) {
+        start[level] = first;
+        if (per_level[level])
+          g_tessellation_groups.push_back({level, first, per_level[level]});
+        first += per_level[level];
+      }
+      auto *out = static_cast<uint32_t *>(alloc.cpu);
+      for (u32 p = 0; p < patches; ++p) {
+        const u32 own = entries[size_t(p) * 2 + 1] & 0xFF;
+        const u32 at = start[own]++;
+        out[size_t(at) * 2] = entries[size_t(p) * 2];
+        out[size_t(at) * 2 + 1] = entries[size_t(p) * 2 + 1];
+      }
+      sc.tessellation_patches = alloc.gpu_address;
+      tessellation[0] = 3;
+      g.patch_levels = true;
+      if (render_profile::Enabled())
+        g_tess_stats.vertices += own_vertices - uint64_t(patches) * segments * segments * per_segment;
+    }
+  }
   return true;
 }
 
@@ -3372,7 +3485,19 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
 
   stages.Enter(render_profile::Stage::kGeometry);
   Geometry geometry;
-  if (call.tessellation ? !PrepareTessellation(device, call, geometry, sc.tessellation)
+  // Patches each at their own level: the instances are a list (renutVertexRegisters kind 3),
+  // which per-instance vertex streams would not follow, so only for a vertex
+  // shader that reads every input by the patch index (vfetchBound), as the
+  // water's do; Vulkan only (its instance index includes the first instance).
+  const bool patch_levels = call.tessellation && IsVulkan() &&
+                            REXCVAR_GET(renut_tessellation_per_patch) && vs->entry &&
+                            std::all_of(g_shaderVertexInputs + vs->entry->vertexInputOffset,
+                                        g_shaderVertexInputs + vs->entry->vertexInputOffset +
+                                            vs->entry->vertexInputCount,
+                                        [](const ShaderVertexInput &input) {
+                                          return (input.flags & kVertexInputBoundFetch) != 0;
+                                        });
+  if (call.tessellation ? !PrepareTessellation(device, call, geometry, sc, patch_levels)
                         : !PrepareGeometry(device, call, geometry)) {
     return false;
   }
@@ -3519,6 +3644,9 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   if (geometry.indexed) {
     SetIndexBuffer(cmd, geometry.index_view);
     cmd->drawIndexedInstanced(geometry.index_count, 1, 0, 0, 0);
+  } else if (geometry.patch_levels) {
+    for (const TessellationGroup &group : g_tessellation_groups)
+      cmd->drawInstanced(group.segments * group.segments * 3, group.count, 0, group.first);
   } else {
     cmd->drawInstanced(geometry.vertex_count, geometry.instance_count, 0, 0);
   }
@@ -3654,6 +3782,7 @@ void AdvanceStreamCacheFrameLocked() {
   // With renut_render_profile on, every 600 frames: how often each lookup's
   // prediction from last frame's order held (FrameOrder).
   if (phase == 100) {
+    const TessellationStats tess = std::exchange(g_tess_stats, {});
     const FrameOrderStats stats[] = {g_stream_memo.TakeStats(), g_index_memo.TakeStats(),
                                      g_fetch_memo.TakeStats(), TakeShaderOrderStatsLocked()};
     if (render_profile::Enabled()) {
@@ -3661,12 +3790,23 @@ void AdvanceStreamCacheFrameLocked() {
       std::string parts;
       for (size_t i = 0; i < std::size(stats); ++i) {
         const FrameOrderStats &o = stats[i];
-        const double total = double(std::max<uint64_t>(o.hits + o.resyncs + o.misses, 1));
-        parts += fmt::format("{}{} {:.0f} a frame, {:.1f}% hit, {:.1f}% resynced, {:.1f}% missed",
+        const double total = double(std::max<uint64_t>(o.hits + o.older + o.resyncs + o.misses, 1));
+        parts += fmt::format("{}{} {:.0f} a frame, {:.1f}% hit, {:.1f}% hit two frames back, "
+                             "{:.1f}% resynced, {:.1f}% missed",
                              i ? "; " : "", kNames[i], total / 600.0, 100.0 * o.hits / total,
-                             100.0 * o.resyncs / total, 100.0 * o.misses / total);
+                             100.0 * o.older / total, 100.0 * o.resyncs / total,
+                             100.0 * o.misses / total);
+        if (o.made || o.absent)
+          parts += fmt::format(" ({:.0f} made, {:.0f} absent a frame)", o.made / 600.0, o.absent / 600.0);
       }
-      RGPU_INFO("Lookup order: {}", parts);
+      RGPU_INFO("Lookup order: {}; entries: {} streams, {} index ranges, {} fetches", parts,
+                g_stream_cache.size(), g_index_cache.size(), g_fetch_cache.size());
+      if (tess.draws) {
+        RGPU_INFO("Tessellation: {:.1f} draws, {:.0f}k vertices drawn a frame; the {:.0f} adaptive "
+                  "patches a frame at each one's own level would be {:.0f}k",
+                  tess.draws / 600.0, tess.vertices / 600e3, tess.adaptive_patches / 600.0,
+                  tess.own_vertices / 600e3);
+      }
     }
   }
 }

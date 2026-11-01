@@ -61,7 +61,8 @@ extern ShaderVertexInput g_shaderVertexInputs[];
 // Entry layout the generator wrote. A cache from an older XenosRecomp lacks
 // the symbol and fails to link rather than zero-filling the newer fields.
 // 6: the viewport epilogue (g_ScreenSpace) and the memexport rewrite.
-constexpr uint32_t kShaderCacheLayout = 6;
+// 7: triangle patches each at its own level (renutVertexRegisters kind 3).
+constexpr uint32_t kShaderCacheLayout = 7;
 extern const uint32_t g_shaderCacheLayout;
 
 // zstd-compressed concatenations of every entry's DXIL / smol-v SPIR-V.
