@@ -96,7 +96,11 @@ struct ShaderPrediction {
   // The same lookup (FrameOrder::Record): the same address.
   bool operator==(const ShaderPrediction &o) const { return va == o.va; }
 };
-FrameOrder<ShaderPrediction> g_shader_order[2];
+struct ShaderPredictionKey {
+  uint64_t operator()(const ShaderPrediction &p) const { return p.va; }
+};
+using ShaderOrder = FrameOrder<ShaderPrediction, ShaderPredictionKey>;
+ShaderOrder g_shader_order[2];
 uint64_t g_shader_generation = 1;
 
 void ForgetShader(u32 shader_va) {
@@ -123,12 +127,12 @@ ShaderRecord *FindShaderLocked(u32 shader_va, RecordKind kind) {
   if (!shader_va)
     return nullptr;
   const u32 kind_index = KindIndex(kind);
-  FrameOrder<ShaderPrediction> &order = g_shader_order[kind_index];
+  ShaderOrder &order = g_shader_order[kind_index];
   // The list is the predictions themselves (no record read to check one), so
   // the whole of FrameOrder's reach is searched.
   ShaderPrediction found;
   if (const ShaderPrediction *p =
-          order.Find(FrameOrder<ShaderPrediction>::kSeek, [shader_va](const ShaderPrediction &p) {
+          order.Find(ShaderOrder::kSeek, [shader_va](const ShaderPrediction &p) {
             return p.va == shader_va && p.generation == g_shader_generation;
           })) {
     found = *p;

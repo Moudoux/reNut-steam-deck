@@ -51,6 +51,8 @@ uint64_t g_frames = 0;
 // This frame's, for the spike log.
 uint32_t g_frame_draws = 0, g_frame_builds = 0, g_frame_uploads = 0, g_frame_async_uploads = 0;
 double g_frame_fill_wait_ms = 0.0;
+double g_frame_create_ms = 0.0;
+uint32_t g_frame_conversions = 0;
 uint32_t g_spikes_logged = 0;
 Clock::time_point g_spike_window = Clock::now();
 double g_busy_ms = 0.0;
@@ -158,6 +160,16 @@ void AddTextureFillWait(double ms) {
     g_frame_fill_wait_ms += ms;
 }
 
+void AddTextureCreate(double ms) {
+  if (Enabled())
+    g_frame_create_ms += ms;
+}
+
+void CountStreamConversions(uint32_t count) {
+  if (Enabled())
+    g_frame_conversions += count;
+}
+
 void FrameDone(double busy_ms) {
   const double interval = REXCVAR_GET(renut_render_profile);
   const double recorder_ms = CommandRecorder::TakeBusyMs();
@@ -178,13 +190,16 @@ void FrameDone(double busy_ms) {
     }
     if (g_spikes_logged++ < 30) {
       RGPU_INFO("Render thread spike: {:.1f} ms, {} draws, {} pipelines built, {} textures uploaded "
-                "({} read on the upload thread, {:.1f} ms finishing them at submission)",
+                "({} read on the upload thread, {:.1f} ms finishing them at submission, {:.1f} ms "
+                "creating textures), {} vertex streams converted",
                 busy_ms, g_frame_draws, g_frame_builds, g_frame_uploads, g_frame_async_uploads,
-                g_frame_fill_wait_ms);
+                g_frame_fill_wait_ms, g_frame_create_ms, g_frame_conversions);
     }
   }
   g_frame_draws = g_frame_builds = g_frame_uploads = g_frame_async_uploads = 0;
   g_frame_fill_wait_ms = 0.0;
+  g_frame_create_ms = 0.0;
+  g_frame_conversions = 0;
   g_recorder_ms += recorder_ms;
   if (Clock::now() - g_since >= std::chrono::duration<double>(interval)) {
     Report();

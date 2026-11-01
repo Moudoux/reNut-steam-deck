@@ -357,6 +357,7 @@ struct PendingStreamFill {
   plume::RenderBufferReference host_ref;  // 'host' on the GPU
   StreamKey key{};   // cacheable: the g_stream_cache entry
   bool cacheable = false;
+  uint64_t hash = 0;  // cacheable: of the guest bytes, made with the conversion
 };
 struct PendingCopy {
   const u8 *src = nullptr;
@@ -827,15 +828,34 @@ void DropCachedFetch(CachedFetch &c) {
 }
 
 // After a flush made the fetch copies: count how long each buffer's bytes
-// have held, and give one that has held long enough its persistent copy.
+// have held, and give one that has held long enough its persistent copy. The
+// buffers are hashed on the render thread and the helpers (parallel.h), in
+// one pass between choosing them and counting: a frame of new geometry has
+// hundreds.
 void TrackFetchCopies() {
+  struct Check {
+    const FetchTrack *track;
+    CachedFetch *cached;
+    uint64_t hash;
+  };
+  static std::vector<Check> checks;
+  checks.clear();
   for (const FetchTrack &t : g_fetch_tracks) {
     CachedFetch &c = g_fetch_memo.Get(g_fetch_cache, t.key, true)->second;
     c.last_used = g_stream_cache_frame;
     if (c.dynamic || c.copy || c.pending || c.checked_frame == g_stream_cache_frame)
       continue;
     c.checked_frame = g_stream_cache_frame;
-    const uint64_t hash = HashFetch(t.key);
+    checks.push_back({&t, &c, 0});
+  }
+  parallel::For(checks.size(), 8, [](size_t begin, size_t end) {
+    for (size_t i = begin; i < end; ++i)
+      checks[i].hash = HashFetch(checks[i].track->key);
+  });
+  for (const Check &check : checks) {
+    const FetchTrack &t = *check.track;
+    CachedFetch &c = *check.cached;
+    const uint64_t hash = check.hash;
     if (hash == c.hash) {
       ++c.stable;
       c.changes = 0;
@@ -879,7 +899,7 @@ void TrackConvertedStream(const PendingStreamFill &f) {
   CachedStream &c = it->second;
   if (c.dynamic || c.copy || c.pending)
     return;
-  const uint64_t hash = HashGuestStream(f.key);
+  const uint64_t hash = f.hash;
   c.stable = hash == c.hash ? c.stable + 1 : 0;
   c.hash = hash;
   const u32 bytes = f.count * f.stream.host_stride;
@@ -3322,11 +3342,15 @@ void FlushVertexFillsLocked() {
   // Each fill and copy reads its own guest bytes into its own upload memory:
   // they go on the helper threads too (parallel.h).
   const size_t fills = g_stream_fill_count;
+  render_profile::CountStreamConversions(u32(fills));
   parallel::For(fills + g_copy_fills.size(), 4, [fills](size_t begin, size_t end) {
     for (size_t i = begin; i < end; ++i) {
       if (i < fills) {
-        const PendingStreamFill &f = g_stream_fills[i];
+        PendingStreamFill &f = g_stream_fills[i];
         ConvertVertices(f.stream, f.guest, f.stride, f.count, f.endian, f.host);
+        // For TrackConvertedStream, here rather than one by one after.
+        if (f.cacheable)
+          f.hash = HashGuestStream(f.key);
       } else {
         const PendingCopy &c = g_copy_fills[i - fills];
         std::memcpy(c.dst, c.src, c.size);

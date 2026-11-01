@@ -202,8 +202,13 @@ Result: the shader cache step went from ~30 min on one core to minutes.
     µs per draw, 496–582 → 595–600 frames per 10 s, and the runs of 17–20 ms
     frames gone (left: frames that upload textures while streaming in).
   - The frame before last is kept too, with its own point: moving, 1.5–2.3%
-    of the lookups are found there and not in last frame's. (Tried for the
-    fetch lookups, which miss ~99%: they are not alternating buffers, ~0.2%.)
+    of the lookups are found there and not in last frame's.
+  - After 8 misses in a row, a result is looked for in an index of the
+    frame's items (made then) and the point moves past it: a long stretch
+    this frame has elsewhere no longer leaves the point behind for the rest of
+    the frame. The fetch lookups take a batch at each flush, at other draws
+    from frame to frame, and missed ~99%; now 30–42%. No measurable change in
+    µs per draw (2026-11-01).
 - **Shaders made ahead of their first draw** (`ShaderPreparer` in
   `gpu/render/shader_library.cpp`): a shader the game creates (at a load) is
   decoded (`smolv::Decode`) and created on a thread of its own, and its first
@@ -228,6 +233,11 @@ Result: the shader cache step went from ~30 min on one core to minutes.
     pixel shading was not the cost. Tried first and dropped: a 2x1 fragment
     shading rate for the water's pipelines (`VK_KHR_fragment_shading_rate`, a
     plume patch) saved nothing (3.35 → 3.46 ms).
+- **New geometry hashed in parallel** (`FlushStreamFills`' loop,
+  `TrackFetchCopies`): a converted stream's and a copied fetch buffer's guest
+  bytes, hashed to count how long they hold, are hashed by the render thread
+  and the `parallel.h` helpers with the conversions, not one by one after.
+  No measurable change at a hub arrival (2026-11-01).
 - **Cache sweep** (`AdvanceStreamCacheFrameLocked`): sweeps each map for
   minute-idle entries every 600 frames, the three maps 200 frames apart.
   Before, all three every 60 frames: a frame over budget every second. A
@@ -277,8 +287,9 @@ Result: the shader cache step went from ~30 min on one core to minutes.
     the view).
   - **Spike log:** with `renut_render_profile` on, every frame whose
     render-thread work passes 1/60 s logs its ms, draws, pipelines built,
-    textures uploaded, how many of those the upload thread read, and the ms
-    spent finishing its reads at submission (at most 30 a minute).
+    textures uploaded, how many of those the upload thread read, the ms
+    spent finishing its reads at submission, the ms creating textures and the
+    vertex streams converted (at most 30 a minute).
   - **Lookup order:** with `renut_render_profile` on, every 600 frames a
     `Lookup order:` line: per lookup (streams, indices, fetches, shaders),
     how many a frame and the share predicted at last frame's point, at the
@@ -397,11 +408,16 @@ the same day (perf over a hub → workshop → hub round trip, and the logs).
 
 ### Other
 
-- Moving the camera, lookups still miss their prediction 13–30% of the time
-  (streams, indices, shaders; resyncs ~1–2%), and the fetch lookups miss
-  ~99% of the time even standing still, though every key is one an earlier
-  frame had and it is not two buffers in turn (`Lookup order:` lines,
-  2026-11-01). They are ~2.5% of the render thread.
+- Frames over 1/60 s left (2026-11-01, spike log):
+  - Arriving in the hub: about ten frames of 20–80 ms, converting ~2,000
+    vertex streams for the first time (texture creation 0–3 ms, the upload
+    thread's reads ~0). Converting the hub's geometry during the load would
+    take them away.
+  - The densest views, 5,700–5,950 draws: 16.7–18.7 ms. The per-draw cost
+    (~2.6–3.0 µs) is spread over the whole draw path; with the lookups'
+    predictions broken (a bug, one run) it was only ~5% higher.
+- Make the PGO profile again from a longer session: the lookup code has
+  changed since this one.
 - Busy parts of the hub (~5,500–5,750 draws) have both the render thread
   (~16 ms) and the GPU (14.5–15 ms, 99% busy at ~940 MHz, the package at 15 W)
   at the limit on the same frames (2026-11-01, before the tessellation
