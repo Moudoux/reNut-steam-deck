@@ -18,6 +18,7 @@ set(RENUT_SOURCES
     src/renut_engine/game/StopNSwap.cpp
 	src/renut_engine/game/frameHooks.cpp
 	src/renut_engine/perf/frame_stats.cpp
+	src/renut_engine/perf/pgo_dump.cpp
 	src/renut_engine/game/frontend_debug_menu.cpp
 	src/renut_engine/game/graphics_menu.cpp
 	src/renut_engine/game/level_pools.cpp

@@ -3,8 +3,12 @@
 # See docs/STEAM_DECK.md. Each step is skipped when already done, so this is
 # also the incremental rebuild.
 #
-#   deck/build.sh            build (out/build/linux-amd64-release/renut-x86_64.AppImage)
-#   deck/build.sh --shell    a shell in the container, mounts as for the build
+#   deck/build.sh                 build (out/build/linux-amd64-release/renut-x86_64.AppImage),
+#                                 with deck/renut.profdata (PGO) when it exists
+#   deck/build.sh --pgo-generate  the build that writes that profile (in
+#                                 out/build/linux-amd64-release-pgo-generate)
+#   deck/build.sh --pgo-merge     merges the Deck's profile into deck/renut.profdata
+#   deck/build.sh --shell         a shell in the container, mounts as for the build
 #
 # Needs: docker; assets/default.xex and assets/default.xexp (TU3, see the docs),
 # assets/Bundle (the game's Bundle folder, or a symlink to it).
@@ -21,6 +25,20 @@ DXC_DIR="$ROOT/thirdparty/reblue-XenosRecomp/thirdparty/dxc-bin"
 # rounds as without -march. -gline-tables-only: perf can name source lines
 # (no code change, a few MB).
 FLAGS="-march=znver2 -ffp-contract=off -gline-tables-only"
+
+# Profile-guided optimisation (docs/STEAM_DECK.md: "Profile-guided build"):
+# the profile build counts what runs into /tmp/renut-pgo on the Deck
+# (src/renut_engine/perf/pgo_dump.cpp writes it while the game runs); the
+# normal build compiles with the merged profile. A function changed since
+# the profile was made is compiled as without one.
+PGO_PROFILE="$ROOT/deck/renut.profdata"
+PGO_DECK_DIR=/tmp/renut-pgo
+if [ "${1:-}" = "--pgo-generate" ]; then
+  BUILD="$ROOT/out/build/linux-amd64-release-pgo-generate"
+  FLAGS="$FLAGS -fprofile-generate=$PGO_DECK_DIR"
+elif [ -f "$PGO_PROFILE" ]; then
+  FLAGS="$FLAGS -fprofile-use=$PGO_PROFILE -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+fi
 
 # assets/Bundle may be a symlink to the game's extracted Bundle elsewhere: the
 # container sees that folder at the same path, read-only.
@@ -41,6 +59,16 @@ DOCKERFILE_HASH="$(sha256sum "$ROOT/deck/Dockerfile" | cut -c1-16)"
 if [ "$(docker image inspect -f '{{index .Config.Labels "renut.dockerfile"}}' "$IMAGE" 2>/dev/null)" != "$DOCKERFILE_HASH" ]; then
   echo "== build image $IMAGE"
   docker build --label "renut.dockerfile=$DOCKERFILE_HASH" -t "$IMAGE" "$ROOT/deck"
+fi
+
+if [ "${1:-}" = "--pgo-merge" ]; then
+  HOST="${DECK_HOST:-deck@steamdeck}"
+  RAW="$ROOT/out/pgo"
+  rm -rf "$RAW" && mkdir -p "$RAW"
+  scp -q "$HOST:$PGO_DECK_DIR/*.profraw" "$RAW/"
+  run llvm-profdata-20 merge -o "$PGO_PROFILE" "$RAW"
+  ls -la "$PGO_PROFILE"
+  exit
 fi
 
 if [ "${1:-}" = "--shell" ]; then
@@ -105,9 +133,10 @@ done
 echo "== codegen"
 run /sdk/out/install/linux-amd64/bin/rexglue codegen renut_manifest.toml
 
-if [ ! -f "$BUILD/CMakeCache.txt" ]; then
+# Configured again when the flags change (a profile added, say).
+if ! grep -qxF "CMAKE_CXX_FLAGS:STRING=$FLAGS" "$BUILD/CMakeCache.txt" 2>/dev/null; then
   echo "== configure"
-  run cmake --preset linux-amd64-release -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
+  run cmake --preset linux-amd64-release -B "$BUILD" -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
       -Drexglue_DIR=/sdk/out/install/linux-amd64/lib/cmake/rexglue \
       "-DCMAKE_C_FLAGS=$FLAGS" "-DCMAKE_CXX_FLAGS=$FLAGS"
 fi

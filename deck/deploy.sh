@@ -5,12 +5,13 @@
 #
 #   deck/deploy.sh           fails if the game is running
 #   deck/deploy.sh --wait    waits (up to an hour) for the game to exit first
+#   APPIMAGE=<file> deck/deploy.sh   deploys that build instead (the PGO profile build)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOST="${DECK_HOST:-deck@steamdeck}"
 DEST="${DECK_DIR:-/run/media/deck/SM256/Recompilations/reNut}"
-APPIMAGE="$ROOT/out/build/linux-amd64-release/renut-x86_64.AppImage"
+APPIMAGE="${APPIMAGE:-$ROOT/out/build/linux-amd64-release/renut-x86_64.AppImage}"
 
 running() { ssh -o BatchMode=yes "$HOST" 'pgrep -x AppRun >/dev/null'; }
 
