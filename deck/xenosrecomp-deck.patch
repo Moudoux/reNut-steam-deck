@@ -20,7 +20,7 @@ index 3fb4933..0273f95 100644
      target_compile_definitions(XenosRecomp PRIVATE _CRT_SECURE_NO_WARNINGS)
      add_custom_command(TARGET XenosRecomp POST_BUILD
 diff --git a/XenosRecomp/main.cpp b/XenosRecomp/main.cpp
-index c41e9da..b1c7647 100644
+index c41e9da..6b2e899 100644
 --- a/XenosRecomp/main.cpp
 +++ b/XenosRecomp/main.cpp
 @@ -166,8 +166,17 @@ int main(int argc, char** argv)
@@ -53,3 +53,87 @@ index c41e9da..b1c7647 100644
  
  #ifdef XENOS_RECOMP_DXIL
                  shader.dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false);
+@@ -349,7 +360,7 @@ int main(int argc, char** argv)
+         // Entries carry vertexFetchMemoryMask, textureFetchMask, memExportConstants,
+         // floatConstants and their range of g_shaderVertexInputs; 6: shaders with the
+         // screen-space viewport epilogue and the rewritten memExport.
+-        f.println("extern const uint32_t g_shaderCacheLayout = 6;");
++        f.println("extern const uint32_t g_shaderCacheLayout = 7;");
+ #endif
+ 
+         writeAllBytes(output, f.out.data(), f.out.size());
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index e3273a9..aaf27e8 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -105,6 +105,9 @@ struct PushConstants
+ // 1344: in guest pixels, the corner of the tile a draw predicated to one tile renders to; the
+ // pixel position is relative to it, as the GPU's is to the EDRAM a tile renders in.
+ #define g_PixelOrigin              vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 1344)
++// 1352: triangle patches each at its own level (renutVertexRegisters, kind 3): the device address
++// of one uint2 per instance.
++#define g_TessellationPatches      vk::RawBufferLoad<uint64_t>(g_PushConstants.SharedConstants + 1352, 8)
+ #define g_AlphaThreshold          vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 552)
+ #define g_AlphaTestFunc            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 556)
+ // 64-bit loads through a physical pointer need their alignment stated (the default is 4).
+@@ -932,6 +935,12 @@ float4 vfetchBound(uint4 element, uint slot, float indexValue, bool roundIndex,
+ // there), and in r1.y a corner permutation, 0 the identity. Quad patches (vs_b2740b93db9023c2,
+ // vs_c1cb11c6c0f59fb8): the patch index in r0.x, the domain (u, v) in r0.yz, and in r1.x a corner
+ // rotation, 0 the identity.
++// Kind 3 (SPIR-V only), triangle patches each at its own level, as the console tessellates them:
++// the host draws the patches of one level together, and instance i's uint2 at
++// g_TessellationPatches + 8i holds its patch index and (bits 0-7) its level, (8-15, 16-23,
++// 24-31) the segments of its edges from control point 0 to 1, 1 to 2 and 2 to 0. A vertex on an
++// edge moves to the nearest of that edge's segment ends, so two patches of different levels meet
++// at the same points (their shared edge has one factor), without cracks.
+ void renutVertexRegisters(uint vertexId, uint instanceId, uint4 tessellation, out float4 r0, out float4 r1)
+ {
+     r0 = float4(vertexId + tessellation.w, 0.0, 0.0, 0.0);
+@@ -941,9 +950,19 @@ void renutVertexRegisters(uint vertexId, uint instanceId, uint4 tessellation, ou
+ 
+     uint level = max(tessellation.y, 1u);
+     float patchIndex = float(tessellation.z + instanceId);
++    uint3 edges = 0u;
++#ifdef __spirv__
++    if (tessellation.x == 3u)
++    {
++        const uint2 patch = vk::RawBufferLoad<uint2>(g_TessellationPatches + uint64_t(instanceId) * 8u, 8);
++        patchIndex = float(patch.x);
++        level = max(patch.y & 0xFFu, 1u);
++        edges = max(uint3(patch.y >> 8, patch.y >> 16, patch.y >> 24) & 0xFFu, 1u);
++    }
++#endif
+     uint triangleIndex = vertexId / 3u;
+     uint corner = vertexId % 3u;
+-    if (tessellation.x == 1u)
++    if (tessellation.x == 1u || tessellation.x == 3u)
+     {
+         // Row r of the grid (from control point 0) holds 2r + 1 triangles, alternately pointing
+         // away from and towards control point 0. Grid vertex (a, b), b <= a <= level, has
+@@ -962,6 +981,26 @@ void renutVertexRegisters(uint vertexId, uint instanceId, uint4 tessellation, ou
+         else
+             vertex = corner == 0u ? uint2(row, b) : (corner == 1u ? uint2(row + 1u, b + 1u) : uint2(row, b + 1u));
+         float3 weights = float3(level - vertex.x, vertex.x - vertex.y, vertex.y) / float(level);
++        if (tessellation.x == 3u)
++        {
++            // Edge 0 (b = 0) runs a / level from control point 0 to 1, edge 1 (a = level) b /
++            // level from 1 to 2, edge 2 (a = b) a / level from 0 to 2.
++            if (vertex.y == 0u)
++            {
++                const float t = round(float(vertex.x * edges.x) / float(level)) / float(edges.x);
++                weights = float3(1.0 - t, t, 0.0);
++            }
++            else if (vertex.x == level)
++            {
++                const float t = round(float(vertex.y * edges.y) / float(level)) / float(edges.y);
++                weights = float3(0.0, 1.0 - t, t);
++            }
++            else if (vertex.x == vertex.y)
++            {
++                const float t = round(float(vertex.x * edges.z) / float(level)) / float(edges.z);
++                weights = float3(1.0 - t, 0.0, t);
++            }
++        }
+         r0.xyz = weights.zyx;
+         r1.x = patchIndex;
+     }

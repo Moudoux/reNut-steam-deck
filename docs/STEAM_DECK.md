@@ -178,6 +178,33 @@ Result: the shader cache step went from ~30 min on one core to minutes.
   - Measured in the hub, walking and turning the camera: 2.98–3.72 → 2.40–2.81
     µs per draw, 496–582 → 595–600 frames per 10 s, and the runs of 17–20 ms
     frames gone (left: frames that upload textures while streaming in).
+  - The frame before last is kept too, with its own point: moving, 1.5–2.3%
+    of the lookups are found there and not in last frame's. (Tried for the
+    fetch lookups, which miss ~99%: they are not alternating buffers, ~0.2%.)
+- **Shaders made ahead of their first draw** (`ShaderPreparer` in
+  `gpu/render/shader_library.cpp`): a shader the game creates (at a load) is
+  decoded (`smolv::Decode`) and created on a thread of its own, and its first
+  draw takes it. Before, that happened at the first draw, on the render thread:
+  perf walking the hub against standing had it as nearly all the extra time
+  (~200 ms in 10 s, in the frames where something came into view). A draw
+  that comes first waits for the one being made, or makes it itself.
+- **Tessellated triangle patches each at their own level** (`PrepareTessellation`
+  in `gpu/render/draw.cpp`, `renutVertexRegisters` kind 3 in XenosRecomp's
+  `shader_common.h`, shader cache layout 7): the water's patches are sorted by
+  their own level (their highest edge factor) and each level is one instanced
+  draw over a per-instance list (patch index, level, edge segments at
+  `SharedConstants` 1352). A vertex on an edge snaps to that edge's segments,
+  so neighbours of different levels meet without cracks. Before, every patch
+  of a draw was drawn at the highest level any edge of the draw asked for.
+  Only for vertex shaders that read every input by patch index (`vfetchBound`);
+  `renut_tessellation_per_patch = false` draws the old way.
+  - Measured at the hub's water (2026-11-01): 1,307k → 216k vertices a frame,
+    the water's draws 3.53 → 0.86 ms of GPU time, the GPU frame 12.4–13.6 →
+    10.2–10.5 ms. No visible change (no cracks).
+  - Each vertex of the water's shader fetches five textures (the waves); its
+    pixel shading was not the cost. Tried first and dropped: a 2x1 fragment
+    shading rate for the water's pipelines (`VK_KHR_fragment_shading_rate`, a
+    plume patch) saved nothing (3.35 → 3.46 ms).
 - **Cache sweep** (`AdvanceStreamCacheFrameLocked`): sweeps each map for
   minute-idle entries every 600 frames, the three maps 200 frames apart.
   Before, all three every 60 frames: a frame over budget every second. A
@@ -231,8 +258,12 @@ Result: the shader cache step went from ~30 min on one core to minutes.
     spent finishing its reads at submission (at most 30 a minute).
   - **Lookup order:** with `renut_render_profile` on, every 600 frames a
     `Lookup order:` line: per lookup (streams, indices, fetches, shaders),
-    how many a frame and the share predicted at the point, found by the scan
-    (resynced) and missed.
+    how many a frame and the share predicted at last frame's point, at the
+    frame before's, found by the scan (resynced) and missed; how many lookups
+    made an entry or found none; the caches' entry counts.
+  - **Tessellation:** in the same 600 frames, a `Tessellation:` line: the
+    tessellated draws and vertices drawn a frame, and what the adaptive
+    patches would need each at its own level.
   - **Linear textures:** with `renut_render_profile` on, every 600 frames a
     `Linear textures:` line: how many were checked, the hashes and MB hashed
     per frame, and the 8 that cost most, each with its hashes, changes,
@@ -343,9 +374,19 @@ the same day (perf over a hub → workshop → hub round trip, and the logs).
 
 ### Other
 
-- Moving the camera, lookups still miss their prediction 13–26% of the time
-  (streams, indices, shaders; resyncs ~1%), and the fetch lookups miss
-  ~100% of the time even standing still (`Lookup order:` lines, 2026-11-01).
+- Moving the camera, lookups still miss their prediction 13–30% of the time
+  (streams, indices, shaders; resyncs ~1–2%), and the fetch lookups miss
+  ~99% of the time even standing still, though every key is one an earlier
+  frame had and it is not two buffers in turn (`Lookup order:` lines,
+  2026-11-01). They are ~2.5% of the render thread.
+- Busy parts of the hub (~5,500–5,750 draws) have both the render thread
+  (~16 ms) and the GPU (14.5–15 ms, 99% busy at ~940 MHz, the package at 15 W)
+  at the limit on the same frames (2026-11-01, before the tessellation
+  change). The game's own threads use ~2 cores besides.
+- Resolves (~1 ms) and depth resolves (~0.75 ms) are the GPU's resolve and
+  copy commands already. Only the depth words of the shadow maps' resolves
+  could be left out (~0.1–0.3 ms); the scene's are read every frame by the
+  depth of field.
 
 - The render thread's remaining per-draw cost is spread out: texture
   binding ~15%, `DrawNeedsExportFlush` ~12%, `UploadFloatConstants` ~6%.
