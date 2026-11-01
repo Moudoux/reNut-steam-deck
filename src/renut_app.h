@@ -58,6 +58,9 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#if !defined(_WIN32)
+#include <SDL3/SDL_hints.h>
+#endif
 
 #include <rexglass/rexglass.h>
 #include <rexglue_guide/guide.h>
@@ -67,6 +70,12 @@ public:
     static constexpr const char *kAppName = "renut";
 
     RenutApp() : rex::app::TitleApp(kAppName, kPPCImageConfig), app_name_(kAppName) {
+#if !defined(_WIN32)
+        // The overlay keeps SDL's text input on for its text fields, which on a
+        // Steam Deck pops Steam's on-screen keyboard up at launch. Set before the
+        // UI system starts SDL.
+        SDL_SetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD, "0");
+#endif
         renut::paths::PrepareWritableFolder();
         renut::crash::InstallCrashDumps();
     }

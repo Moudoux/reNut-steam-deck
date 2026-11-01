@@ -72,6 +72,10 @@ class Stages {
 // A draw was recorded.
 void CountDraw();
 
+// For the spike log: a pipeline built on the render thread, a texture uploaded.
+void CountPipelineBuild();
+void CountTextureUpload();
+
 // The render thread finished a frame, busy for 'busy_ms' (its waits left out):
 // adds it, and logs the report when it is due.
 void FrameDone(double busy_ms);
