@@ -251,6 +251,9 @@ From Mumbo's workshop out to the hub, the same walk before and after:
 
 - **Logs:** `~/.local/share/renut/logs/renut.log`. Look for `GPU profile:`,
   `Render thread profile: … (x us per draw)` and `Render thread spike:`.
+  A spike's ms is the render thread's work since the game last queued a
+  frame: when the game queues none for a while (a load held by the jiggy
+  wall, `Jiggy wall: held shut …`), all of it shows as one long "frame".
 - **CPU samples:**
   - Find the render thread: the `[tNNN]` of `GPU profile:` lines.
   - Record: `perf record -F 499 --call-graph dwarf,16384 -t <tid> -o /tmp/x.data -- sleep 8`.
@@ -258,12 +261,21 @@ From Mumbo's workshop out to the hub, the same walk before and after:
   - By line: `-F 999` without `-g`, then `--sort srcline`. The build has line
     tables.
   - By time, for one spike among normal frames: `perf script --inline -F
-    time,ip,sym --time <start>,<end>` and count samples per 100 ms by the
-    functions on their stacks (at 499 Hz a sample is ~2 ms). Busy stretches
-    show where a load ends. Run the awk from a script file copied to the
-    Deck; nested ssh quoting expands its `$` fields locally. `perf report
+    tid,time,ip,sym --tid <tid> --time <start>,<end>` and count samples per
+    100 ms by the functions on their stacks (at 499 Hz a sample is ~2 ms).
+    Busy stretches show where a load ends. Stream `perf script`'s output back
+    over ssh and count on the PC: nothing has to be copied to the Deck. Run
+    it while the game still runs (it reads the AppImage's mount). `perf report
     --time <start>,<end>` gives the leaf functions of the same window.
-  - Delete the data file afterwards.
+  - Whole process (`-p <pid>`): `-e cpu-clock --call-graph dwarf,8192`, ~1.8 GB
+    for 150 s in the Deck's RAM-backed `/tmp`. Dump it one thread at a time
+    (`--tid`): a whole-process `perf script` left most stacks empty.
+  - Log times: `-k mono` works with `cpu-clock` only (the hardware cycles
+    event refuses a clock). The Deck suspends, so the monotonic clock is not
+    `/proc/uptime`: anchor it to log events (a load's `Guest D3D device
+    released` is where the render thread goes idle).
+  - Afterwards delete the data file, `~/.debug` (perf's copy of every binary
+    profiled, ~170 MB a session) and `/tmp/perf-vdso.so-*`.
 - **Per-thread CPU from `/proc/<pid>/task/*/stat`:** parse after the last
   `) `. Thread names contain spaces.
 - **GPU clock / busy / power:** `/sys/class/drm/card0/device/{pp_dpm_sclk,gpu_busy_percent}`
@@ -287,23 +299,29 @@ On the Deck, after deploying:
 
 ### Tracked frame-time problems
 
-Found measuring the texture upload thread (2026-11-01). Each: what is known,
-how to see it, and what to find out first.
+Found measuring the texture upload thread (2026-11-01); 1 and 2 investigated
+the same day (perf over a hub → workshop → hub round trip, and the logs).
 
-1. **A ~780 ms frame at the end of the workshop's load.** Entering Mumbo's
-   workshop from the hub, after the loading screen: one frame of 779.7 ms
-   with 9,416 draws, 2 textures uploaded, no pipelines built, then 64 ms
-   with 112 uploads (`Render thread spike` lines, 16:06:23). Neither
-   uploads nor pipelines, so its cause is unknown. Behind the loading screen,
-   so it may hardly show. First: perf over the end of that load (start
-   recording before leaving the hub: the last attempt stopped ~3 s early),
-   and see whether it happens on every entry.
-2. **Arrival frames in the hub.** Out of the workshop into the hub, the first
-   frames take 20–40 ms with 6,000–9,500 draws and no texture wait (39.6 ms
-   at 7,384 draws, 28.2 ms at 9,551). A guess, not measured: the first
-   conversions of the area's vertices and indices, and cold caches. This is
-   the hitch still visible on arriving. First: perf bucketed by time over the
-   arrival ([Profiling on the Deck](#profiling-on-the-deck), by time).
+1. **A ~780 ms frame at the end of the workshop's load: not a hitch.**
+   The 779.7 ms "frame" (9,416 draws, 16:06:23) came right after `Jiggy
+   wall: held shut 17438 ms for the world's pipelines`: the wall
+   (`game/jiggy_wall_hold.cpp`, upstream) kept the load going while the
+   world's pipelines built, the game queued no frame meanwhile, and the
+   spike log summed the render thread's 17 s of work as one frame (the
+   10 s profile line due then came out at the same moment, over 169 frames).
+   A workshop entry that needed no hold (2026-11-01 18:14, pipelines built)
+   had no frame over 20 ms.
+2. **Arrival frames in the hub: explained, not changed.** The 20–44 ms
+   frames came after 66 s in the workshop: the cache sweep had dropped the
+   hub's minute-idle entries meanwhile (stream cache
+   243 → 78 MB), and the arrival converted them again (78 → 306 MB; its
+   first frames 4–7 µs per draw, the later ones heavy only by draw count,
+   6,000–9,600). After a 7 s visit nothing had been dropped: no arrival frame
+   over 19 ms, and perf bucketed per 100 ms showed the arrival the same as
+   standing in the hub. The first arrival of a session (nothing cached yet)
+   has the same frames. Not measured under perf after a stay over a minute.
+   If it is worth fixing: keep entries through a load, or sweep by a longer
+   idle time.
 3. **Linear textures' `ContentHash`: fixed.** It was ~3.6% of the render
    thread walking the hub: nearly all of it the font cache, hashed whole at
    every frame that drew text (4 MB a frame). See "Font cache checked by its
