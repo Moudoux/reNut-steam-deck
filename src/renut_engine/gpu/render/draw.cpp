@@ -28,6 +28,7 @@
 #include "renut_engine/gpu/d3d/d3d.h"
 #include "renut_engine/gpu/render/ambient_occlusion.h"
 #include "renut_engine/gpu/render/format.h"
+#include "renut_engine/gpu/render/frame_order.h"
 #include "renut_engine/gpu/render/graphics_options.h"
 #include "renut_engine/gpu/render/parallel.h"
 #include "renut_engine/gpu/guest/guest_memory.h"
@@ -577,43 +578,37 @@ public:
   }
 
   // The map's entry for 'key', made if 'make' (else null when it has none).
-  // First the entry this frame's same lookup (by count) had last frame, or the
-  // next one's when this frame has one lookup fewer so far: the draws come in
-  // the same order frame after frame, and that list is read in order, where
-  // the slots are a random line each (two cache misses a lookup were an eighth
-  // of the render thread, 2026-11-01 Deck trace).
+  // First the entry the same point of last frame's lookups had, or the next
+  // one's (FrameOrder): two cache misses a lookup in the slots were an eighth
+  // of the render thread (2026-11-01 Deck trace).
   Entry *Get(Map &map, const typename Map::key_type &key, bool make) {
-    const size_t n = ordinal_;
-    if (n < predicted_.size()) {
-      if (Entry *p = predicted_[n]; p && p->first == key) {
-        ordinal_ = n + 1;
-        return p;
-      }
-      if (n + 1 < predicted_.size()) {
-        if (Entry *p = predicted_[n + 1]; p && p->first == key) {
-          ordinal_ = n + 2;
-          return p;
-        }
+    for (size_t ahead = 0; ahead < 2; ++ahead) {
+      if (Entry *const *p = order_.Peek(ahead); p && *p && (*p)->first == key) {
+        Entry *entry = *p;
+        order_.Take(ahead, entry);
+        return entry;
       }
     }
     Entry *entry = Lookup(map, key, make);
-    if (n < kMaxPredicted) {
-      if (n >= predicted_.size())
-        predicted_.resize(n + 1, nullptr);
-      predicted_[n] = entry;
+    if (entry) {
+      if (auto ahead = order_.Seek([entry](Entry *e) { return e == entry; })) {
+        order_.Take(*ahead, entry);
+        return entry;
+      }
     }
-    ordinal_ = n + 1;
+    order_.Add(entry);
     return entry;
   }
 
   // A new frame's lookups begin (AdvanceStreamCacheFrameLocked).
-  void NextFrame() { ordinal_ = 0; }
+  void NextFrame() { order_.NextFrame(); }
 
   void Clear() {
     std::fill(std::begin(slots_), std::end(slots_), Slot{});
-    predicted_.clear();
-    ordinal_ = 0;
+    order_.Clear();
   }
+
+  FrameOrderStats TakeStats() { return order_.TakeStats(); }
 
 private:
   Entry *Lookup(Map &map, const typename Map::key_type &key, bool make) {
@@ -632,7 +627,6 @@ private:
     return &*it;
   }
 
-  static constexpr size_t kMaxPredicted = 1u << 16;
   struct Slot {
     size_t hash = 0;
     Entry *entry = nullptr;
@@ -641,8 +635,7 @@ private:
     return u32((uint64_t(hash) * 0x9E3779B97F4A7C15ull) >> (64 - kBits));
   }
   alignas(32) Slot slots_[2u << kBits];
-  std::vector<Entry *> predicted_;  // last frame's entry per lookup, in order
-  size_t ordinal_ = 0;              // this frame's lookups so far
+  FrameOrder<Entry *> order_;
 };
 
 struct CachedStream {
@@ -3657,6 +3650,25 @@ void AdvanceStreamCacheFrameLocked() {
         return true;
       }))
     g_index_memo.Clear();
+
+  // With renut_render_profile on, every 600 frames: how often each lookup's
+  // prediction from last frame's order held (FrameOrder).
+  if (phase == 100) {
+    const FrameOrderStats stats[] = {g_stream_memo.TakeStats(), g_index_memo.TakeStats(),
+                                     g_fetch_memo.TakeStats(), TakeShaderOrderStatsLocked()};
+    if (render_profile::Enabled()) {
+      static constexpr const char *kNames[] = {"streams", "indices", "fetches", "shaders"};
+      std::string parts;
+      for (size_t i = 0; i < std::size(stats); ++i) {
+        const FrameOrderStats &o = stats[i];
+        const double total = double(std::max<uint64_t>(o.hits + o.resyncs + o.misses, 1));
+        parts += fmt::format("{}{} {:.0f} a frame, {:.1f}% hit, {:.1f}% resynced, {:.1f}% missed",
+                             i ? "; " : "", kNames[i], total / 600.0, 100.0 * o.hits / total,
+                             100.0 * o.resyncs / total, 100.0 * o.misses / total);
+      }
+      RGPU_INFO("Lookup order: {}", parts);
+    }
+  }
 }
 
 StreamCacheMemory StreamCacheMemoryLocked() {

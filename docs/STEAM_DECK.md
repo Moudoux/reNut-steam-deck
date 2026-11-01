@@ -168,6 +168,16 @@ Result: the shader cache step went from ~30 min on one core to minutes.
 - **Shader lookups** (`FindShaderLocked` in `gpu/d3d/hooks/shader.cpp`): the
   same in-order prediction. Any `ForgetShader` bumps a generation, so a
   prediction never outlives its record.
+- **Predictions keep their place** (`FrameOrder` in `gpu/render/frame_order.h`,
+  used by both of the above): the point reached in last frame's lookups is
+  kept apart from this frame's count. A lookup last frame did not have (an
+  object come into view) leaves the point where it is; one found further on
+  (objects gone out of view) moves it there, within a scan of 32. Before, one
+  new object put every later prediction of the frame one off, so moving the
+  camera made the rest of each frame miss.
+  - Measured in the hub, walking and turning the camera: 2.98–3.72 → 2.40–2.81
+    µs per draw, 496–582 → 595–600 frames per 10 s, and the runs of 17–20 ms
+    frames gone (left: frames that upload textures while streaming in).
 - **Cache sweep** (`AdvanceStreamCacheFrameLocked`): sweeps each map for
   minute-idle entries every 600 frames, the three maps 200 frames apart.
   Before, all three every 60 frames: a frame over budget every second. A
@@ -219,6 +229,10 @@ Result: the shader cache step went from ~30 min on one core to minutes.
     render-thread work passes 1/60 s logs its ms, draws, pipelines built,
     textures uploaded, how many of those the upload thread read, and the ms
     spent finishing its reads at submission (at most 30 a minute).
+  - **Lookup order:** with `renut_render_profile` on, every 600 frames a
+    `Lookup order:` line: per lookup (streams, indices, fetches, shaders),
+    how many a frame and the share predicted at the point, found by the scan
+    (resynced) and missed.
   - **Linear textures:** with `renut_render_profile` on, every 600 frames a
     `Linear textures:` line: how many were checked, the hashes and MB hashed
     per frame, and the 8 that cost most, each with its hashes, changes,
@@ -328,6 +342,10 @@ the same day (perf over a hub → workshop → hub round trip, and the logs).
    unlocks" above.
 
 ### Other
+
+- Moving the camera, lookups still miss their prediction 13–26% of the time
+  (streams, indices, shaders; resyncs ~1%), and the fetch lookups miss
+  ~100% of the time even standing still (`Lookup order:` lines, 2026-11-01).
 
 - The render thread's remaining per-draw cost is spread out: texture
   binding ~15%, `DrawNeedsExportFlush` ~12%, `UploadFloatConstants` ~6%.

@@ -13,6 +13,7 @@
 
 #include "renut_engine/gpu/d3d/d3d.h"
 #include "renut_engine/gpu/guest/guest_records.h"
+#include "renut_engine/gpu/render/frame_order.h"
 #include "renut_engine/gpu/render/vertex_format.h"
 #include "shader_cache.h"
 
@@ -70,6 +71,9 @@ ShaderRecord *FindShaderLocked(u32 shader_va, RecordKind kind);
 
 // A new frame's shader lookups begin (FindShaderLocked's prediction).
 void NextShaderFrameLocked();
+
+// FindShaderLocked's predictions since the last call, both kinds together.
+FrameOrderStats TakeShaderOrderStatsLocked();
 
 // Drops the host side of an in-place guest shader object, if it has one.
 // Requires State().mutex.

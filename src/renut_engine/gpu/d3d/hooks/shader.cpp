@@ -14,6 +14,7 @@
  */
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -22,6 +23,7 @@
 #include <rex/types.h>
 
 #include "renut_engine/gpu/render/draw.h"
+#include "renut_engine/gpu/render/frame_order.h"
 #include "renut_engine/gpu/guest/guest_memory.h"
 #include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/backend/render_thread.h"
@@ -85,18 +87,15 @@ ShaderMemoSet &ShaderMemoSetFor(u32 kind_index, u32 shader_va) {
 // shaders, and this is one compare where the memo is a cache miss.
 ShaderMemo g_last_shader[2];
 
-// The shader each lookup (by count, per kind) found last frame: draws come in
-// the same order every frame, and this list is read in order where the memo's
-// sets are a random line each. A forgotten shader ends the generation, so no
-// prediction outlives its record.
+// The shader the same point of last frame's lookups (per kind) found
+// (FrameOrder), read in order where the memo's sets are a random line each.
+// A forgotten shader ends the generation, so no prediction outlives its record.
 struct ShaderPrediction {
   u32 va = 0;
   ShaderRecord *record = nullptr;
   uint64_t generation = 0;
 };
-constexpr size_t kMaxShaderPredictions = 1u << 16;
-std::vector<ShaderPrediction> g_shader_predicted[2];
-size_t g_shader_ordinal[2] = {};
+FrameOrder<ShaderPrediction> g_shader_order[2];
 uint64_t g_shader_generation = 1;
 
 void ForgetShader(u32 shader_va) {
@@ -123,24 +122,43 @@ ShaderRecord *FindShaderLocked(u32 shader_va, RecordKind kind) {
   if (!shader_va)
     return nullptr;
   const u32 kind_index = KindIndex(kind);
-  std::vector<ShaderPrediction> &predicted = g_shader_predicted[kind_index];
-  const size_t n = g_shader_ordinal[kind_index]++;
-  if (n < predicted.size()) {
-    const ShaderPrediction &p = predicted[n];
-    if (p.va == shader_va && p.generation == g_shader_generation)
-      return p.record;
+  FrameOrder<ShaderPrediction> &order = g_shader_order[kind_index];
+  if (const ShaderPrediction *p = order.Peek();
+      p && p->va == shader_va && p->generation == g_shader_generation) {
+    ShaderRecord *record = p->record;
+    order.Take(0, *p);
+    return record;
+  }
+  const std::optional<size_t> ahead =
+      order.Seek([shader_va](const ShaderPrediction &p) { return p.va == shader_va; });
+  if (ahead) {
+    if (const ShaderPrediction *p = order.Peek(*ahead); p->generation == g_shader_generation) {
+      ShaderRecord *record = p->record;
+      order.Take(*ahead, *p);
+      return record;
+    }
   }
   ShaderRecord *record = FindShaderUnpredicted(shader_va, kind, kind_index);
-  if (n < kMaxShaderPredictions) {
-    if (n >= predicted.size())
-      predicted.resize(n + 1);
-    predicted[n] = {shader_va, record, g_shader_generation};
-  }
+  const ShaderPrediction found{shader_va, record, g_shader_generation};
+  if (ahead)
+    order.Take(*ahead, found);
+  else
+    order.Add(found);
   return record;
 }
 
 void NextShaderFrameLocked() {
-  g_shader_ordinal[0] = g_shader_ordinal[1] = 0;
+  g_shader_order[0].NextFrame();
+  g_shader_order[1].NextFrame();
+}
+
+FrameOrderStats TakeShaderOrderStatsLocked() {
+  FrameOrderStats stats = g_shader_order[0].TakeStats();
+  const FrameOrderStats pixel = g_shader_order[1].TakeStats();
+  stats.hits += pixel.hits;
+  stats.resyncs += pixel.resyncs;
+  stats.misses += pixel.misses;
+  return stats;
 }
 
 namespace {
