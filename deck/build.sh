@@ -35,9 +35,12 @@ run() {
     -v "$SDK:/sdk" -v "$ROOT:$ROOT" "${GAME_MOUNT[@]}" -w "$ROOT" "$IMAGE" "$@"
 }
 
-if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+# Rebuilt whenever the Dockerfile changes (the image carries its hash): an
+# image older than its Dockerfile's libtbb-dev left XenosRecomp on one thread.
+DOCKERFILE_HASH="$(sha256sum "$ROOT/deck/Dockerfile" | cut -c1-16)"
+if [ "$(docker image inspect -f '{{index .Config.Labels "renut.dockerfile"}}' "$IMAGE" 2>/dev/null)" != "$DOCKERFILE_HASH" ]; then
   echo "== build image $IMAGE"
-  docker build -t "$IMAGE" "$ROOT/deck"
+  docker build --label "renut.dockerfile=$DOCKERFILE_HASH" -t "$IMAGE" "$ROOT/deck"
 fi
 
 if [ "${1:-}" = "--shell" ]; then
@@ -107,6 +110,15 @@ if [ ! -f "$BUILD/CMakeCache.txt" ]; then
   run cmake --preset linux-amd64-release -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
       -Drexglue_DIR=/sdk/out/install/linux-amd64/lib/cmake/rexglue \
       "-DCMAKE_C_FLAGS=$FLAGS" "-DCMAKE_CXX_FLAGS=$FLAGS"
+fi
+
+# XenosRecomp configured without TBB (an image without it) compiles the
+# shader cache on one thread: start it again in this image.
+XENOS="$BUILD/xenos_recomp"
+if [ -f "$XENOS/build/CMakeCache.txt" ] && grep -q '^TBB_DIR:PATH=TBB_DIR-NOTFOUND' "$XENOS/build/CMakeCache.txt"; then
+  echo "== XenosRecomp was configured without TBB: reconfiguring"
+  rm -rf "$XENOS/build" "$XENOS/src/renut_xenos_recomp-stamp/renut_xenos_recomp-configure"
+  mkdir -p "$XENOS/build"
 fi
 
 echo "== build"

@@ -5,11 +5,27 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#elif defined(__linux__)
+#include <pthread.h>
+#endif
 
 #include <xxhash.h>
 
@@ -390,15 +406,115 @@ struct PendingFill {
 };
 std::vector<PendingFill> g_pending_fills;
 
-// Records the copies of every level into 't'. The guest data is read now, or
-// when the command list is submitted if 'defer_read'.
-bool Upload(HostTexture &t, const TextureFetch &fetch, bool defer_read) {
+// The texture upload thread: reads tiled textures' guest data into their
+// staging from the draw that uploads them on, while the render thread goes on
+// with the frame. Read at the draw, a texture streaming in stalled the render
+// thread on its untiling (ReadLevel was 54 of a 91 ms frame of 334 uploads,
+// perf on a Steam Deck, 2026-11-01). The copies are recorded at the draw as
+// before: only their staging has to be filled by the time the command list is
+// submitted (Finish), as for the linear textures' fills. One thread: the CPU
+// and the GPU share the target's power budget (a Steam Deck's 15 W).
+class UploadThread {
+public:
+  static UploadThread &Get() {
+    // Never destroyed, like the render thread: the thread waits on it until exit.
+    static UploadThread *thread = new UploadThread;
+    return *thread;
+  }
+
+  // A texture's fills (render thread).
+  void Queue(std::vector<PendingFill> fills) {
+    {
+      std::lock_guard lock(mutex_);
+      queue_.push_back(std::move(fills));
+    }
+    work_cv_.notify_one();
+  }
+
+  // Returns once every fill queued has been read: what the thread has not
+  // started is read here, on the render thread and the helpers (parallel.h).
+  // Before the command list is submitted (render thread).
+  void Finish() {
+    std::deque<std::vector<PendingFill>> left;
+    {
+      std::lock_guard lock(mutex_);
+      if (queue_.empty() && !busy_)
+        return;
+      left.swap(queue_);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<const PendingFill *> fills;
+    for (const auto &job : left) {
+      for (const PendingFill &f : job)
+        fills.push_back(&f);
+    }
+    parallel::For(fills.size(), 1, [&fills](size_t begin, size_t end) {
+      for (size_t i = begin; i < end; ++i)
+        Read(*fills[i]);
+    });
+    {
+      std::unique_lock lock(mutex_);
+      idle_cv_.wait(lock, [this] { return !busy_; });
+    }
+    render_profile::AddTextureFillWait(
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+  }
+
+private:
+  UploadThread() { std::thread(&UploadThread::Run, this).detach(); }
+
+  static void Read(const PendingFill &f) {
+    ReadLevel(f.info, f.fetch, f.src, f.blocks_w, f.blocks_h, f.depth, f.dst, f.row_pitch,
+              f.slice_pitch, f.menu_panel);
+  }
+
+  void Run() {
+#if defined(_WIN32)
+    SetThreadDescription(GetCurrentThread(), L"renut texture uploads");
+#elif defined(__linux__)
+    pthread_setname_np(pthread_self(), "renut uploads");
+#endif
+    for (;;) {
+      std::vector<PendingFill> job;
+      {
+        std::unique_lock lock(mutex_);
+        work_cv_.wait(lock, [this] { return !queue_.empty(); });
+        job = std::move(queue_.front());
+        queue_.pop_front();
+        busy_ = true;
+      }
+      for (const PendingFill &f : job)
+        Read(f);
+      {
+        std::lock_guard lock(mutex_);
+        busy_ = false;
+      }
+      idle_cv_.notify_one();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable work_cv_;  // a job queued
+  std::condition_variable idle_cv_;  // the thread finished its job
+  std::deque<std::vector<PendingFill>> queue_;
+  bool busy_ = false;  // the thread is reading a job it took
+};
+
+// When an upload's guest data is read (Upload).
+enum class ReadAt {
+  kDraw,    // now
+  kSubmit,  // when the command list is submitted (g_pending_fills)
+  kThread,  // on the texture upload thread, from now until the submission
+};
+
+// Records the copies of every level into 't', the guest data read as 'read_at'.
+bool Upload(HostTexture &t, const TextureFetch &fetch, ReadAt read_at) {
   u32 block_width, block_height;
   FormatBlockSize(fetch.Format(), block_width, block_height);
 
   auto &s = State();
   plume::RenderCommandList *cmd = s.command_list;
-  render_profile::CountTextureUpload();
+  render_profile::CountTextureUpload(read_at == ReadAt::kThread);
   static const uint32_t kProfileLabel = gpu_profile::Label("texture uploads");
   gpu_profile::Mark(s, kProfileLabel);
   cmd->barriers(plume::RenderBarrierStage::COPY,
@@ -412,6 +528,7 @@ bool Upload(HostTexture &t, const TextureFetch &fetch, bool defer_read) {
   const uint32_t bs = t.info.block_size;
   const bool menu_panel = MenuPanelCandidate(t);
   t.menu_colour = MenuColourGeneration();
+  std::vector<PendingFill> thread_fills;
   for (uint32_t level = 0; level < t.mip_levels; ++level) {
     const uint32_t w = std::max(1u, t.width >> level);
     const uint32_t h = std::max(1u, t.height >> level);
@@ -443,12 +560,19 @@ bool Upload(HostTexture &t, const TextureFetch &fetch, bool defer_read) {
       src.base = GuestPhysicalPtr<const uint8_t>((page << 12) + level_offset +
                                                  guest_slice * layout.slice_bytes);
       UploadAllocation staging = s.uploads[s.frame].Allocate(uint64_t(slice_pitch) * d, 512);
-      if (!staging)
+      if (!staging) {
+        // The copies recorded so far still read theirs.
+        if (!thread_fills.empty())
+          UploadThread::Get().Queue(std::move(thread_fills));
         return false;
+      }
       auto *dst = static_cast<uint8_t *>(staging.cpu);
-      if (defer_read)
-        g_pending_fills.push_back(
-            {t.info, fetch, src, blocks_w, blocks_h, d, dst, row_pitch, slice_pitch, menu_panel});
+      const PendingFill fill{t.info, fetch, src, blocks_w, blocks_h, d, dst, row_pitch, slice_pitch,
+                             menu_panel};
+      if (read_at == ReadAt::kSubmit)
+        g_pending_fills.push_back(fill);
+      else if (read_at == ReadAt::kThread)
+        thread_fills.push_back(fill);
       else
         ReadLevel(t.info, fetch, src, blocks_w, blocks_h, d, dst, row_pitch, slice_pitch, menu_panel);
       // Footprints are in texels, block-aligned for compressed formats. Decoded
@@ -484,6 +608,8 @@ bool Upload(HostTexture &t, const TextureFetch &fetch, bool defer_read) {
       }
     }
   }
+  if (!thread_fills.empty())
+    UploadThread::Get().Queue(std::move(thread_fills));
   return true;
 }
 
@@ -787,7 +913,7 @@ void RefreshLinearLocked(HostTexture &t, const TextureFetch &fetch) {
   ApplyUnlocksLocked();
   auto upload = [&](uint64_t hash) {
     t.content_hash = hash;
-    t.uploaded = Upload(t, fetch, true);
+    t.uploaded = Upload(t, fetch, ReadAt::kSubmit);
   };
   const bool verify_due = g_frame - t.verified_frame >= kLinearVerifyFrames;
   if (!t.uploaded) {
@@ -814,7 +940,7 @@ void RefreshLinearLocked(HostTexture &t, const TextureFetch &fetch) {
       t.content_hash = hash;
       t.verified_frame = g_frame;
     }
-    t.uploaded = Upload(t, fetch, true);
+    t.uploaded = Upload(t, fetch, ReadAt::kSubmit);
   } else {
     const uint64_t hash = ContentHash(fetch, t);
     if (hash != t.content_hash) {
@@ -895,6 +1021,7 @@ void NoteTextureUnlocked(u32 resource_va) {
 }
 
 void FlushTextureFillsLocked() {
+  UploadThread::Get().Finish();
   // Each fill writes its own staging memory (parallel.h).
   parallel::For(g_pending_fills.size(), 1, [](size_t begin, size_t end) {
     for (size_t i = begin; i < end; ++i) {
@@ -1034,7 +1161,7 @@ TextureBinding BindUncached(u32 texture_va, const TextureFetch &device_fetch,
       const uint64_t hash = SampleHash(fetch, t);
       if (!t.uploaded || hash != t.content_hash) {
         t.content_hash = hash;
-        t.uploaded = Upload(t, fetch, false);
+        t.uploaded = Upload(t, fetch, ReadAt::kThread);
       }
     }
   }

@@ -72,9 +72,13 @@ class Stages {
 // A draw was recorded.
 void CountDraw();
 
-// For the spike log: a pipeline built on the render thread, a texture uploaded.
+// For the spike log: a pipeline built on the render thread, a texture uploaded
+// ('async': its guest data read on the texture upload thread).
 void CountPipelineBuild();
-void CountTextureUpload();
+void CountTextureUpload(bool async = false);
+// For the spike log: milliseconds the render thread spent finishing the
+// texture upload thread's reads at a submission (UploadThread::Finish).
+void AddTextureFillWait(double ms);
 
 // The render thread finished a frame, busy for 'busy_ms' (its waits left out):
 // adds it, and logs the report when it is due.

@@ -49,7 +49,8 @@ std::array<Clock::duration, size_t(Stage::kCount)> g_stages{};
 uint64_t g_draws = 0;
 uint64_t g_frames = 0;
 // This frame's, for the spike log.
-uint32_t g_frame_draws = 0, g_frame_builds = 0, g_frame_uploads = 0;
+uint32_t g_frame_draws = 0, g_frame_builds = 0, g_frame_uploads = 0, g_frame_async_uploads = 0;
+double g_frame_fill_wait_ms = 0.0;
 uint32_t g_spikes_logged = 0;
 Clock::time_point g_spike_window = Clock::now();
 double g_busy_ms = 0.0;
@@ -145,9 +146,16 @@ void CountPipelineBuild() {
     ++g_frame_builds;
 }
 
-void CountTextureUpload() {
-  if (Enabled())
+void CountTextureUpload(bool async) {
+  if (Enabled()) {
     ++g_frame_uploads;
+    g_frame_async_uploads += async;
+  }
+}
+
+void AddTextureFillWait(double ms) {
+  if (Enabled())
+    g_frame_fill_wait_ms += ms;
 }
 
 void FrameDone(double busy_ms) {
@@ -169,11 +177,14 @@ void FrameDone(double busy_ms) {
       g_spikes_logged = 0;
     }
     if (g_spikes_logged++ < 30) {
-      RGPU_INFO("Render thread spike: {:.1f} ms, {} draws, {} pipelines built, {} textures uploaded",
-                busy_ms, g_frame_draws, g_frame_builds, g_frame_uploads);
+      RGPU_INFO("Render thread spike: {:.1f} ms, {} draws, {} pipelines built, {} textures uploaded "
+                "({} read on the upload thread, {:.1f} ms finishing them at submission)",
+                busy_ms, g_frame_draws, g_frame_builds, g_frame_uploads, g_frame_async_uploads,
+                g_frame_fill_wait_ms);
     }
   }
-  g_frame_draws = g_frame_builds = g_frame_uploads = 0;
+  g_frame_draws = g_frame_builds = g_frame_uploads = g_frame_async_uploads = 0;
+  g_frame_fill_wait_ms = 0.0;
   g_recorder_ms += recorder_ms;
   if (Clock::now() - g_since >= std::chrono::duration<double>(interval)) {
     Report();

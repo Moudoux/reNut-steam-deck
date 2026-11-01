@@ -145,7 +145,8 @@ void AdvanceTextureFrameLocked();
 void NoteTextureUnlocked(u32 resource_va);
 
 // Reads the guest data of uploads recorded with a deferred read (linear
-// textures) into their staging memory. Before the command list is submitted.
+// textures) into their staging memory, and finishes the texture upload
+// thread's reads (tiled textures). Before the command list is submitted.
 void FlushTextureFillsLocked();
 
 // Bindless slot for the texture bound as 'texture_va'. Falls back to the null

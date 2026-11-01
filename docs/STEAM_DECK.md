@@ -49,6 +49,14 @@ Add `upstream` once: `git remote add upstream https://github.com/masterspike52/r
 Re-running it is the incremental build. `deck/build.sh --shell` opens a shell
 in the container with the same mounts.
 
+- **Image kept current:** the image carries a hash of `deck/Dockerfile`
+  (label `renut.dockerfile`) and is rebuilt when the file changes. An image
+  built before the Dockerfile gained `libtbb-dev` had been reused, and
+  XenosRecomp, reconfigured in it, recompiled the shader cache on one core.
+- **XenosRecomp configured without TBB** (its CMake cache says
+  `TBB_DIR-NOTFOUND`): `build.sh` deletes its build directory so it is
+  configured again in the current image.
+
 `linux-amd64-release`, not `-dist`: `-dist` turns on reNut's self-updater,
 which would replace this build with upstream's.
 
@@ -100,7 +108,9 @@ reNut rewrites `renut.toml` on exit: edit it only while the game is closed.
 
 ### Build and repository
 
-- `deck/`: Dockerfile, `build.sh`, `deploy.sh`, the SDK patch, `stfs_extract.py`.
+- `deck/`: Dockerfile, `build.sh` (rebuilds the image when the Dockerfile
+  changes; reconfigures a XenosRecomp built without TBB), `deploy.sh`, the SDK
+  patch, `stfs_extract.py`.
 - `.gitmodules`: plume (upstream had the gitlink without the entry, so a clone
   had an empty `thirdparty/plume`); `ignore = dirty` on XenosRecomp, which
   `build.sh` patches.
@@ -168,6 +178,24 @@ Result: the shader cache step went from ~30 min on one core to minutes.
 - **Stream loops** (`BindStreams`, `ConvertExportedStreamsLocked`): walk
   `HostVertexLayout::used_mask`, not all 16 streams' 32-byte entries
   (8 cache lines a draw).
+- **Texture upload thread** (`UploadThread` in `gpu/render/textures.cpp`):
+  tiled textures' guest data (untiling and conversion, `ReadLevel`) is read
+  on a thread of its own from the draw that uploads them, not at the draw.
+  The copies are still recorded at the draw; only their staging (the frame's
+  upload ring) has to be filled before the command list is submitted, as the
+  linear textures' fills already were. At submission
+  (`FlushTextureFillsLocked`) the render thread and the `parallel.h` helpers
+  read whatever the thread has not started, then wait for its current
+  texture. Nothing is drawn differently: no placeholder, no frame late.
+  - Why: perf on the Deck (hub arrival from Mumbo's workshop, 334 uploads in
+    one frame) had `ReadLevel` at 54 ms of a 91 ms frame. Creating the
+    textures and recording barriers and copies were negligible.
+  - One thread, for the 15 W budget. It sleeps when idle (no CPU time
+    standing in the hub).
+  - Tried first and dropped: copies recorded frames later, drawing the old
+    contents or the null texture meanwhile. Textures whose host copy is
+    rebuilt (another header over the same memory, say) had no old contents
+    and flickered black on the title screen and in the hub.
 - **Profiling:**
   - `renut_gpu_profile_draws`: splits `renut_gpu_profile` by shader pair,
     with draw counts. The query pool is 16384 only in that mode; at 2048
@@ -176,8 +204,9 @@ Result: the shader cache step went from ~30 min on one core to minutes.
     **µs per draw**, the number to compare builds by (it doesn't depend on
     the view).
   - **Spike log:** with `renut_render_profile` on, every frame whose
-    render-thread work passes 1/60 s logs its ms, draws, pipelines built and
-    textures uploaded (at most 30 a minute).
+    render-thread work passes 1/60 s logs its ms, draws, pipelines built,
+    textures uploaded, how many of those the upload thread read, and the ms
+    spent finishing its reads at submission (at most 30 a minute).
 
 ### Measured on the Deck (hub, standing, 2026-11-01)
 
@@ -190,6 +219,17 @@ Result: the shader cache step went from ~30 min on one core to minutes.
 | `/dev/shm` after a killed session | +470 MB each | freed |
 
 The GPU is then ~89% busy at ~950 MHz, with the package at its 15 W cap.
+
+### Measured on the Deck (texture upload thread, 2026-11-01)
+
+From Mumbo's workshop out to the hub, the same walk before and after:
+
+| Frame | Before | After |
+|---|---|---|
+| Arrival, 334 textures uploaded | 91.4 ms | 36.5 ms (14.9 ms finishing reads at submission) |
+| 23 uploads / 11 uploads | 44.0 / 30.0 ms | 39.6 / 28.2 ms (no wait: 7,400 and 9,500 draws) |
+| Streaming in, 6–21 uploads | 18.4–20.8 ms | 16.7–17.2 ms (0–0.9 ms wait) |
+| Standing in the hub | 600 frames / 10 s, ~2.6 µs per draw | 600–601 frames / 10 s, 2.60–2.67 µs per draw |
 
 ## Profiling on the Deck
 
@@ -223,11 +263,13 @@ On the Deck, after deploying:
 
 ## Next work
 
-- **Texture uploads off the render thread.** The remaining spikes (20–44 ms)
-  come with 10–27 texture uploads in a frame when an area streams in. See
-  `Upload()` / `BindUncached()` in `gpu/render/textures.cpp`. The guest
-  reads already run on worker threads (`FlushTextureFillsLocked`), but the
-  render thread waits for them at submit.
+- **Arrival frames with new geometry:** after the upload thread, the hub's
+  first frames after a load still take 20–40 ms with 6,000–9,500 draws and
+  no texture wait: the first conversions of the area's vertices and indices.
+  A ~780 ms frame at the end of the workshop's load (9,416 draws, 2 uploads,
+  no pipelines) is not understood yet.
+- **`ContentHash`** of the linear textures was ~3.6% of the render thread
+  walking the hub (perf, 2026-11-01).
 - The render thread's remaining per-draw cost is spread out: texture
   binding ~15%, `DrawNeedsExportFlush` ~12%, `UploadFloatConstants` ~6%.
 - Profile-guided optimisation (PGO) from a Deck play session.
