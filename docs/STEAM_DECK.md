@@ -216,6 +216,12 @@ Result: the shader cache step went from ~30 min on one core to minutes.
   perf walking the hub against standing had it as nearly all the extra time
   (~200 ms in 10 s, in the frames where something came into view). A draw
   that comes first waits for the one being made, or makes it itself.
+  - **One host shader per cache entry:** the game has many shader objects of one
+    cache entry (3,100 first uses in the hub's first frame, of about 500 made
+    ahead). They now share a `shared_ptr` that lives as long as any of them does.
+    Before, the first object took the prepared shader and each other one decoded
+    its own on the render thread: 2,614 decodes, 191 ms of a 256 ms frame.
+    Pipelines are keyed by the cache entry, so none changes.
 - **Tessellated triangle patches each at their own level** (`PrepareTessellation`
   in `gpu/render/draw.cpp`, `renutVertexRegisters` kind 3 in XenosRecomp's
   `shader_common.h`, shader cache layout 7): the water's patches are sorted by
@@ -238,6 +244,19 @@ Result: the shader cache step went from ~30 min on one core to minutes.
   bytes, hashed to count how long they hold, are hashed by the render thread
   and the `parallel.h` helpers with the conversions, not one by one after.
   No measurable change at a hub arrival (2026-11-01).
+- **Copies checked before a draw reads them after an idle time** (`FreshAfterIdle`
+  in `gpu/render/draw.cpp`): a stream, index or fetch copy no draw has read for
+  120 frames is hashed at the next draw that reads it, before it is bound, and
+  made again if its guest bytes changed. The off-thread check alone would find
+  that only after drawing it. 28–72 stale copies a session (2026-11-02), at most
+  0.4 ms in a frame. (1,171 in a run that kept copies for minutes, dropped below.)
+- **Pool memory reserved at startup** (`CopyPool::Reserve`): the stream, index and
+  fetch pools make 12, 2 and 2 chunks (960 MB) on a thread at the first frame, and
+  keep that many however empty they get. A new block of video memory while frames
+  are drawn cost a frame ~30 ms, on the render thread or, made on another thread,
+  still in that frame (35–39 ms, standing, from a thread keeping one chunk spare).
+  Peak GPU memory did not grow: 2,443 MB before, 1,931–2,187 MB after, as a world
+  fills the pools anyway. The hub alone holds more than it did.
 - **Cache sweep** (`AdvanceStreamCacheFrameLocked`): sweeps each map for
   minute-idle entries every 600 frames, the three maps 200 frames apart.
   Before, all three every 60 frames: a frame over budget every second. A
@@ -290,6 +309,14 @@ Result: the shader cache step went from ~30 min on one core to minutes.
     textures uploaded, how many of those the upload thread read, the ms
     spent finishing its reads at submission, the ms creating textures and the
     vertex streams converted (at most 30 a minute).
+  - **Geometry trace:** with `renut_render_profile` on, a `Geometry frame` and a
+    `Frame shaders` line for every frame over 1/60 s, with 64 or more streams or
+    index ranges no cache had, or where the jiggy wall changed state (at most 400
+    a minute, so a long over-budget stretch can use up that minute's): the wall's
+    words, streams new or converted again, flush and index ms, pool copies,
+    shaders by how `Take` got them, chunks, `FreshAfterIdle`'s hashes. With
+    `renut_render_profile_stages` on also a `Frame stages` line: that frame's ms
+    per stage (`shd` is shaders; they cost ~0.5 µs per draw more).
   - **Lookup order:** with `renut_render_profile` on, every 600 frames a
     `Lookup order:` line: per lookup (streams, indices, fetches, shaders),
     how many a frame and the share predicted at last frame's point, at the
@@ -326,10 +353,30 @@ From Mumbo's workshop out to the hub, the same walk before and after:
 | Streaming in, 6–21 uploads | 18.4–20.8 ms | 16.7–17.2 ms (0–0.9 ms wait) |
 | Standing in the hub | 600 frames / 10 s, ~2.6 µs per draw | 600–601 frames / 10 s, 2.60–2.67 µs per draw |
 
+### Measured on the Deck (hub arrivals, 2026-11-02)
+
+The same route before (879d022 with only the trace added) and after: start into
+the hub, a world for over a minute, back. Frames over 1/60 s in the arrival's first
+second, by the geometry trace.
+
+| Arrival | First three frames, ms | Over 1/60 s | Their total |
+|---|---|---|---|
+| Hub, first, before | 241, 31, 54 | 11 | 596 ms |
+| Hub, first, after | 59, 30, 30 | 9 | 270 ms |
+| World, before | 274, 39, 26 | 8 | 503 ms |
+| World, after | 58, 60, 24 | 6 | 223 ms |
+| Hub, return, before | 251, 33, 36 | 12 | 614 ms |
+| Hub, return, after | 76, 41, 28 | 9 | 301 ms |
+
+The goal of no frame over 1/60 s at an arrival is **not** met: see "Arrival frames"
+under Next work.
+
 ## Profiling on the Deck
 
 - **Logs:** `~/.local/share/renut/logs/renut.log`. Look for `GPU profile:`,
-  `Render thread profile: … (x us per draw)` and `Render thread spike:`.
+  `Render thread profile: … (x us per draw)` and `Render thread spike:`. Sessions
+  append; past 5 MB it rotates to `renut.1.log` (a run with the geometry trace can
+  start in that one).
   A spike's ms is the render thread's work since the game last queued a
   frame: when the game queues none for a while (a load held by the jiggy
   wall, `Jiggy wall: held shut …`), all of it shows as one long "frame".
@@ -390,17 +437,16 @@ the same day (perf over a hub → workshop → hub round trip, and the logs).
    10 s profile line due then came out at the same moment, over 169 frames).
    A workshop entry that needed no hold (2026-11-01 18:14, pipelines built)
    had no frame over 20 ms.
-2. **Arrival frames in the hub: explained, not changed.** The 20–44 ms
-   frames came after 66 s in the workshop: the cache sweep had dropped the
-   hub's minute-idle entries meanwhile (stream cache
-   243 → 78 MB), and the arrival converted them again (78 → 306 MB; its
-   first frames 4–7 µs per draw, the later ones heavy only by draw count,
-   6,000–9,600). After a 7 s visit nothing had been dropped: no arrival frame
-   over 19 ms, and perf bucketed per 100 ms showed the arrival the same as
-   standing in the hub. The first arrival of a session (nothing cached yet)
-   has the same frames. Not measured under perf after a stay over a minute.
-   If it is worth fixing: keep entries through a load, or sweep by a longer
-   idle time.
+2. **Arrival frames in the hub: mostly fixed, see "Arrival frames" below.**
+   After 66 s in the workshop the cache sweep had dropped the hub's entries
+   (stream cache 243 → 78 MB) and the arrival converted them again. After a 7 s
+   visit nothing had been dropped: no arrival frame over 19 ms. Keeping entries
+   longer does not fix it (2026-11-02): kept for a 3-minute world, ~800 MB of
+   them, the hub still converted 2,252 streams. The hub's geometry can come back
+   elsewhere in guest memory: on one return 1,753 of 2,111 streams had moved by
+   one offset (−40,001,536 bytes), and between sessions about half kept their
+   addresses. A 53 s stay kept both entries and addresses (63 conversions). A list
+   of keys saved per level would have to match by content or by that offset.
 3. **Linear textures' `ContentHash`: fixed.** It was ~3.6% of the render
    thread walking the hub: nearly all of it the font cache, hashed whole at
    every frame that drew text (4 MB a frame). See "Font cache checked by its
@@ -408,11 +454,22 @@ the same day (perf over a hub → workshop → hub round trip, and the logs).
 
 ### Other
 
-- Frames over 1/60 s left (2026-11-01, spike log):
-  - Arriving in the hub: about ten frames of 20–80 ms, converting ~2,000
-    vertex streams for the first time (texture creation 0–3 ms, the upload
-    thread's reads ~0). Converting the hub's geometry during the load would
-    take them away.
+- Frames over 1/60 s left (2026-11-02, geometry trace):
+  - **Arrival frames:** 6–9 frames of 17–76 ms in an arrival's first second (table
+    above). The wall has finished opening when the world's first frame comes, so
+    its draws can't be left out behind it.
+    - The first frame (59–76 ms): ~14 ms draws, ~8 flush, 4–7 indices, 345–363
+      textures; part of the rest is not yet attributed.
+    - Frames 2 and 3 (~28–40 ms): the same ~2,000 streams (~40 MB) converted again,
+      since a copy takes 3 stable flushes (8–13 ms a frame), indices 3–7 ms, on top
+      of ~14 ms of draws. Fewer flushes is not worth it: a buffer rewritten every
+      other frame could then draw stale.
+    - Frames of 8,000–10,600 draws, a few per arrival (31–44 ms): over budget by
+      draw count alone (21–28 ms at 2.6 µs). What the extra draws are is unknown.
+      They stop within a second.
+    - Others, not explained: a 60 ms second frame on arriving in a world (once
+      with 30 ms in the fetch stage), single frames of 32–47 ms in the first
+      seconds of the hub.
   - The densest views, 5,700–5,950 draws: 16.7–18.7 ms. The per-draw cost
     (~2.6–3.0 µs) is spread over the whole draw path; with the lookups'
     predictions broken (a bug, one run) it was only ~5% higher.
