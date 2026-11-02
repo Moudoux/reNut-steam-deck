@@ -59,7 +59,7 @@ struct ShaderRecord {
 
   // Built on first use by a pipeline.
   std::mutex host_mutex;
-  std::unique_ptr<plume::RenderShader> host;
+  std::shared_ptr<plume::RenderShader> host;  // shared by the records of one cache entry
 
   bool pixel() const { return kind == RecordKind::PixelShader; }
 };

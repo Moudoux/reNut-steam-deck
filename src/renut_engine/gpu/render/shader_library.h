@@ -31,10 +31,13 @@ std::unique_ptr<plume::RenderShader> CreateCachedShader(plume::RenderDevice *dev
 // Steam Deck, 2026-11-01). PrepareCachedShader queues an entry for a thread
 // of its own (any thread); TakeCachedShader gives the shader it made, waits
 // for one it is making, or makes it there and then as CreateCachedShader does
-// (a queued one is taken off the queue). StopShaderPreparer, at shutdown,
+// (a queued one is taken off the queue). The game has many shader objects of
+// one cache entry: they all share its host shader, which lives as long as any
+// of them does. Each making its own was 2,600 decodes in the hub's first frame
+// (191 ms of its 256, Steam Deck, 2026-11-02). StopShaderPreparer, at shutdown,
 // frees what was made and not taken.
 void PrepareCachedShader(plume::RenderDevice *device, const ShaderCacheEntry *entry);
-std::unique_ptr<plume::RenderShader> TakeCachedShader(plume::RenderDevice *device,
+std::shared_ptr<plume::RenderShader> TakeCachedShader(plume::RenderDevice *device,
                                                       const ShaderCacheEntry &entry);
 void StopShaderPreparer();
 

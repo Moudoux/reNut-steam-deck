@@ -678,6 +678,7 @@ plume::RenderPipeline *TakeAsync(const PipelineKey &key, uint64_t hash, const Ho
   }
   ready = false;
   ++g_deferred_draws;
+  ++render_profile::Geometry().draws_left_out;
   g_last_deferred_ms.store(SteadyMs(), std::memory_order_relaxed);
   if (job->stage == Job::Stage::Pending && !job->asked) {
     job->asked = true;

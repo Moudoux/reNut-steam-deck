@@ -84,6 +84,33 @@ void AddTextureFillWait(double ms);
 void AddTextureCreate(double ms);
 void CountStreamConversions(uint32_t count);
 
+// For the geometry trace ("Geometry frame:" lines): what this frame's draws did
+// about geometry no cache had a copy of, filled in by draw.cpp (render thread).
+struct GeometryFrame {
+  uint32_t streams_first = 0, streams_again = 0, streams_other = 0;  // converted
+  uint64_t stream_bytes = 0;                                         // guest bytes of those
+  uint32_t flushes = 0;
+  double flush_ms = 0.0, convert_ms = 0.0, track_ms = 0.0;  // convert: the parallel part
+  uint32_t index_reads = 0;
+  uint64_t index_bytes = 0;
+  double index_ms = 0.0;
+  uint32_t fetch_copies = 0;
+  uint64_t fetch_bytes = 0;
+  uint32_t pool_copies = 0;
+  uint64_t pool_bytes = 0;
+  uint32_t draws_left_out = 0;
+  uint32_t wall_requests = 0, wall_shown = 0, wall_opening = 0;
+  // ShaderPreparer::Take: made ahead, sharing another record's, waited for, made
+  // on the render thread.
+  uint32_t take_ready = 0, take_shared = 0, take_wait = 0, take_inline = 0;
+  double take_wait_ms = 0.0, take_inline_ms = 0.0;
+  uint32_t chunks = 0;  // pool chunks taken (a spare, or made here)
+  double chunk_ms = 0.0;
+  uint32_t resumed = 0, resume_stale = 0;  // FreshAfterIdle's hashes
+  double resume_ms = 0.0;
+};
+GeometryFrame &Geometry();
+
 // The render thread finished a frame, busy for 'busy_ms' (its waits left out):
 // adds it, and logs the report when it is due.
 void FrameDone(double busy_ms);

@@ -5,10 +5,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -26,6 +28,7 @@
 #endif
 
 #include "renut_engine/gpu/backend/backend.h"
+#include "renut_engine/gpu/backend/render_profile.h"
 #include "renut_engine/gpu/d3d/d3d.h"
 #include "renut_engine/gpu/log.h"
 
@@ -143,12 +146,15 @@ public:
         return;
       if (!thread_.joinable())
         thread_ = std::thread(&ShaderPreparer::Run, this);
-      if (!items_.try_emplace(entry).second)
-        return;  // queued, being made or made already
+      auto [item, added] = items_.try_emplace(entry);
+      // Queued, being made, made already, or in use by a shader record.
+      if (!added && (item->second.state != State::Taken || !item->second.taken.expired()))
+        return;
+      item->second.state = State::Queued;
       device_ = device;
       queue_.push_back(entry);
       // Ones made and never drawn (an object kept off screen) go first.
-      while (items_.size() > kMaxItems && !made_.empty()) {
+      while (made_.size() > kMaxItems) {
         auto it = items_.find(made_.front());
         made_.pop_front();
         if (it != items_.end() && it->second.state == State::Made)
@@ -158,25 +164,53 @@ public:
     work_.notify_one();
   }
 
-  std::unique_ptr<plume::RenderShader> Take(plume::RenderDevice *device, const ShaderCacheEntry &entry) {
+  std::shared_ptr<plume::RenderShader> Take(plume::RenderDevice *device, const ShaderCacheEntry &entry) {
+    using Clock = std::chrono::steady_clock;
+    const auto since = [](Clock::time_point t) {
+      return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+    };
+    render_profile::GeometryFrame &trace = render_profile::Geometry();
     {
+      const Clock::time_point start = Clock::now();
       std::unique_lock lock(mutex_);
-      auto it = items_.find(&entry);
-      if (it != items_.end() && it->second.state == State::Making) {
+      auto it = items_.try_emplace(&entry).first;
+      if (it->second.state == State::Making) {
         done_.wait(lock, [&] {
           it = items_.find(&entry);
           return it == items_.end() || it->second.state != State::Making;
         });
+        // (Made, then let go by a Prepare's clean-up before this woke.)
+        it = items_.try_emplace(&entry).first;
+        ++trace.take_wait;
+        trace.take_wait_ms += since(start);
       }
-      if (it != items_.end()) {
-        std::unique_ptr<plume::RenderShader> shader = std::move(it->second.shader);
-        // Queued: dropped here, and the thread skips it.
-        items_.erase(it);
-        if (shader)
+      Item &item = it->second;
+      if (item.state == State::Made && item.shader) {
+        std::shared_ptr<plume::RenderShader> shader = std::move(item.shader);
+        item.state = State::Taken;
+        item.taken = shader;
+        ++trace.take_ready;
+        return shader;
+      }
+      if (item.state == State::Taken) {
+        if (std::shared_ptr<plume::RenderShader> shader = item.taken.lock()) {
+          ++trace.take_shared;
           return shader;
+        }
       }
+      // Queued: the thread skips it now. (Made, null: it failed; tried again here.)
+      item.state = State::Taken;
+      item.taken.reset();
     }
-    return CreateCachedShader(device, entry);
+    const Clock::time_point make_start = Clock::now();
+    std::shared_ptr<plume::RenderShader> made = CreateCachedShader(device, entry);
+    ++trace.take_inline;
+    trace.take_inline_ms += since(make_start);
+    std::lock_guard lock(mutex_);
+    // (A Prepare meanwhile, finding none in use, made it queued again.)
+    if (Item &item = items_[&entry]; item.state == State::Taken)
+      item.taken = made;
+    return made;
   }
 
   void Stop() {
@@ -194,10 +228,11 @@ public:
   }
 
 private:
-  enum class State { Queued, Making, Made };
+  enum class State { Queued, Making, Made, Taken };
   struct Item {
-    State state = State::Queued;
-    std::unique_ptr<plume::RenderShader> shader;
+    State state = State::Taken;  // as an item not asked for yet: none in use
+    std::shared_ptr<plume::RenderShader> shader;  // Made
+    std::weak_ptr<plume::RenderShader> taken;     // Taken: every record of this entry shares it
   };
   // A level makes a few thousand shaders.
   static constexpr size_t kMaxItems = 8192;
@@ -250,7 +285,7 @@ void PrepareCachedShader(plume::RenderDevice *device, const ShaderCacheEntry *en
     ShaderPreparer::Get().Prepare(device, entry);
 }
 
-std::unique_ptr<plume::RenderShader> TakeCachedShader(plume::RenderDevice *device,
+std::shared_ptr<plume::RenderShader> TakeCachedShader(plume::RenderDevice *device,
                                                       const ShaderCacheEntry &entry) {
   return ShaderPreparer::Get().Take(device, entry);
 }
