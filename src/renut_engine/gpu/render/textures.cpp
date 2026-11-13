@@ -11,6 +11,7 @@
 #include <xxhash.h>
 
 #include "renut_engine/gpu/backend/backend.h"
+#include "renut_engine/gpu/backend/gpu_profile.h"
 #include "renut_engine/gpu/d3d/d3d.h"
 #include "renut_engine/gpu/guest/guest_memory.h"
 #include "renut_engine/gpu/render/graphics_options.h"
@@ -388,6 +389,8 @@ bool Upload(HostTexture &t, const TextureFetch &fetch, bool defer_read) {
 
   auto &s = State();
   plume::RenderCommandList *cmd = s.command_list;
+  static const uint32_t kProfileLabel = gpu_profile::Label("texture uploads");
+  gpu_profile::Mark(s, kProfileLabel);
   cmd->barriers(plume::RenderBarrierStage::COPY,
                 plume::RenderTextureBarrier(t.texture.get(), plume::RenderTextureLayout::COPY_DEST));
   t.layout = plume::RenderTextureLayout::COPY_DEST;
@@ -1219,6 +1222,8 @@ void UpdateResolveMipsLocked(HostTexture *texture, const plume::RenderRect &rect
   const uint32_t source_slot = Level0Slot(t);
   if (!pipeline || source_slot == kInvalidDescriptor)
     return;
+  static const uint32_t kProfileLabel = gpu_profile::Label("resolve host mip levels");
+  gpu_profile::Mark(s, kProfileLabel);
 
   // Each level is the 2x2 box of the one above, drawn into a scratch target over
   // 'rect' widened to whole texels of the smallest level, then copied in.

@@ -7,6 +7,7 @@
 #include <plume_render_interface.h>
 
 #include "renut_engine/gpu/backend/backend.h"
+#include "renut_engine/gpu/backend/gpu_profile.h"
 
 #include "host_shaders/smaa_blend_ps.spirv.h"
 #include "host_shaders/smaa_edge_ps.spirv.h"
@@ -214,6 +215,9 @@ PresentImage ApplySmaaLocked(VideoState &s, const PresentImage &image) {
       return image;
     }
   }
+  static const uint32_t kProfileLabel = gpu_profile::Label("SMAA");
+  gpu_profile::Mark(s, kProfileLabel);
+
   if (image.layout && *image.layout != plume::RenderTextureLayout::SHADER_READ) {
     cmd->barriers(plume::RenderBarrierStage::GRAPHICS,
                   plume::RenderTextureBarrier(image.texture, plume::RenderTextureLayout::SHADER_READ));

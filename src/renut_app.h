@@ -23,6 +23,7 @@
 #include <rexfabric/rexfabric.h>
 #include "renut_engine/ui/settings_dialog.h"
 #include "renut_engine/ui/flag_editor_dialog.h"
+#include "renut_engine/gpu/log.h"
 #include "renut_engine/gpu/overlay/app_integration.h"
 #include "renut_engine/gpu/overlay/draw_list_split.h"
 #include "renut_engine/app/crash_dump.h"
@@ -87,6 +88,7 @@ protected:
     rex::Result<void> OnConfigure(rex::SettingsRegistry &settings) override {
         REX_TRY_VOID(renut::settings::RegisterAll(settings));
         REX_TRY_VOID(REX_LOGGER().AddCategories(rex::log::kRenutLog));
+        REX_TRY_VOID(REX_LOGGER().AddCategories(rex::log::kRenutGpuLog));
         REX_TRY_VOID(rexcrash::Configure(settings));
         REX_TRY_VOID(ConfigureThirdPartyUI(settings));
 

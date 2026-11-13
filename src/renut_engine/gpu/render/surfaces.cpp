@@ -125,6 +125,7 @@ bool BuildTarget(HostSurface &surface, const d3d::SurfaceDesc &desc, uint32_t mi
   surface.width = std::max(d3d::SurfaceWidth(surface.size_word), min_width);
   surface.height = std::max(d3d::SurfaceHeight(surface.size_word), min_height);
   surface.scale = scale;
+  std::fill(std::begin(surface.profile_labels), std::end(surface.profile_labels), UINT32_MAX);
   const uint32_t host_width = surface.scale.Size(surface.width);
   const uint32_t host_height = surface.scale.Size(surface.height);
   surface.depth = d3d::IsDepthFormat(surface.format_word);

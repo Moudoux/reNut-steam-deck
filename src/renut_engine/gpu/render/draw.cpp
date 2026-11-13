@@ -6,6 +6,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <format>
 #include <map>
 #include <mutex>
 #include <string>
@@ -18,6 +19,8 @@
 #include <xxhash.h>
 
 #include "renut_engine/gpu/backend/backend.h"
+#include "renut_engine/gpu/backend/gpu_profile.h"
+#include "renut_engine/gpu/backend/render_profile.h"
 #include "renut_engine/gpu/guest/command_buffers.h"
 #include "renut_engine/gpu/d3d/d3d.h"
 #include "renut_engine/gpu/render/ambient_occlusion.h"
@@ -872,7 +875,21 @@ bool GatherTargets(const GuestDevice &device, Targets &t) {
   return true;
 }
 
+// gpu_profile: draws into 't', by their host size and attachments.
+uint32_t TargetsProfileLabel(const Targets &t) {
+  HostSurface *first = t.color_count ? t.colors[0] : t.depth;
+  const uint32_t variant = t.color_count ? (t.depth ? 1 : 0) : 2;
+  uint32_t &label = first->profile_labels[variant];
+  if (label == UINT32_MAX) {
+    static const char *const kKinds[3] = {"color", "color+depth", "depth"};
+    label = gpu_profile::Label(std::format("draws {}x{} {}", first->scale.Size(first->width),
+                                           first->scale.Size(first->height), kKinds[variant]));
+  }
+  return label;
+}
+
 bool BindTargets(const Targets &t) {
+  gpu_profile::Mark(State(), TargetsProfileLabel(t));
   for (uint32_t i = 0; i < t.color_count; ++i)
     TransitionSurfaceLocked(t.colors[i], plume::RenderTextureLayout::COLOR_WRITE);
   if (t.depth)
@@ -2959,6 +2976,8 @@ bool ConvertExportedStreamsLocked(VideoState &s, const GuestDevice &device, cons
           plume::RenderBufferBarrier(s.memexport_buffer[slot].get(), plume::RenderBufferAccess::WRITE);
     }
   }
+  static const uint32_t kProfileLabel = gpu_profile::Label("exported stream conversion");
+  gpu_profile::Mark(s, kProfileLabel);
   cmd->barriers(plume::RenderBarrierStage::COMPUTE, barriers, barrier_count);
   cmd->setComputePipelineLayout(s.stream_convert_layout.get());
   cmd->setPipeline(s.stream_convert_pipeline.get());
@@ -3156,6 +3175,8 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   const GuestDevice device(device_state);
   if (!device.valid())
     return false;
+  render_profile::Stages stages;
+  stages.Enter(render_profile::Stage::kShaders);
 
   const u32 vs_va = device.U32(d3d::kDeviceOffsetVertexShader);
   auto *vs = FindShaderLocked(vs_va, RecordKind::VertexShader);
@@ -3188,6 +3209,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
 
   // Earlier memexport results reach guest memory before this draw reads them
   // (WaitForExportsLocked may submit the list: before anything is recorded).
+  stages.Enter(render_profile::Stage::kExportWait);
   const FloatConstants vs_constants = DrawFloatConstants(device_state, replay, false);
   const FloatConstants ps_constants = DrawFloatConstants(device_state, replay, true);
   // Waiting for an older slot's results leaves the current slot's, which the
@@ -3200,6 +3222,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
       break;
     WaitForExportsLocked(slots);
   }
+  stages.Enter(render_profile::Stage::kShaders);
   if (!Video::EnsureCommandListLocked())
     return false;
   SyncBound(s);
@@ -3213,6 +3236,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   if (!GatherTargets(device, targets))
     return false;
   // Everything that records copies or barriers comes before the framebuffer.
+  stages.Enter(render_profile::Stage::kTextures);
   SharedConstants sc;
   std::memset(&sc, 0, sizeof(sc));
   // NutTool's world materials: the draw's record, whose emissive texture is in fetch constant 1.
@@ -3226,6 +3250,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   if (ps && ps->entry)
     MatchSunCascades(device.dev(), ps_constants, ps->entry->floatConstants, sc);
 
+  stages.Enter(render_profile::Stage::kConstants);
   const d3d::Device &dev = device.dev();
   const u8 *bools = reinterpret_cast<const u8 *>(&dev.m_Constants.VertexShaderB[0]);
   SwapEndian(2, bools, sc.booleans, sizeof(sc.booleans));
@@ -3268,6 +3293,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     sc.point_state[3] = float(point_min_max >> 16) / 16.0f;
   }
 
+  stages.Enter(render_profile::Stage::kGeometry);
   Geometry geometry;
   if (call.tessellation ? !PrepareTessellation(device, call, geometry, sc.tessellation)
                         : !PrepareGeometry(device, call, geometry)) {
@@ -3277,6 +3303,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   // it in PrepareGeometry); the guest's r0.x is the vertex index itself.
   if (!call.tessellation)
     sc.tessellation[3] = geometry.first_vertex;
+  stages.Enter(render_profile::Stage::kVertexFetch);
   GpuStreams gpu_streams;
   if (!ConvertExportedStreamsLocked(s, device, call, *vs, shader_strides, *declaration, geometry,
                                     gpu_streams)) {
@@ -3293,6 +3320,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   const u32 fetch_mask = (vs->entry ? vs->entry->vertexFetchMemoryMask : 0) | shape_fetch |
                          DescribeBoundFetches(device, call, *vs, *declaration, shader_strides, sc);
   UploadAllocation fetch_alloc = UploadVertexFetchData(device, call, fetch_mask, sc);
+  stages.Enter(render_profile::Stage::kConstants);
   static constexpr u32 kAllRegisters[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
   static constexpr u32 kNoRegisters[8] = {};
   const u32 *vs_used = vs->entry ? vs->entry->floatConstants : kAllRegisters;
@@ -3325,6 +3353,7 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   if (!fetch_alloc.ref.ref || !vs_alloc || !ps_alloc || !sc_alloc || !memexport)
     return false;
 
+  stages.Enter(render_profile::Stage::kPipeline);
   PipelineKey key = MakeKey(device, vs, ps, declaration, targets, call.primitive, geometry.per_instance);
   if (alpha_to_coverage)
     key.alpha_to_coverage = 1;
@@ -3333,8 +3362,10 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
   plume::RenderPipeline *pipeline = GetPipelineLocked(key, {host_vs, host_ps, &declaration->layout});
   if (!pipeline)
     return false;
+  stages.Enter(render_profile::Stage::kTargets);
   if (!BindTargets(targets))
     return false;
+  stages.Enter(render_profile::Stage::kRecord);
   plume::RenderCommandList *cmd = s.command_list;
   SetViewport(cmd, viewport.viewport, viewport.scissor, targets.color_count);
 
@@ -3380,10 +3411,13 @@ bool DrawStateLocked(const u8 *device_state, const DrawCall &call, const ReplayC
     SetRootDescriptor(cmd, plume::RenderBufferReference(memexport), kDrawRootMemExport);
   }
 
+  stages.Enter(render_profile::Stage::kStreams);
   if (!BindStreams(device, call, *vs, shader_strides, declaration->layout,
                    declaration->layout_hash, geometry, gpu_streams)) {
     return false;
   }
+  stages.Enter(render_profile::Stage::kRecord);
+  render_profile::CountDraw();
   if (geometry.indexed) {
     SetIndexBuffer(cmd, geometry.index_view);
     cmd->drawIndexedInstanced(geometry.index_count, 1, 0, 0, 0);
@@ -3569,6 +3603,8 @@ bool ResolveDepth(HostSurface *surface, HostTexture *dest, const ClearRect &src,
     return false;
   }
   plume::RenderCommandList *cmd = s.command_list;
+  static const uint32_t kProfileLabel = gpu_profile::Label("depth resolves");
+  gpu_profile::Mark(s, kProfileLabel);
   TransitionSurfaceLocked(surface, plume::RenderTextureLayout::SHADER_READ);
   TransitionTextureLocked(dest, plume::RenderTextureLayout::COLOR_WRITE);
   TransitionTextureLocked(dest->words.get(), plume::RenderTextureLayout::COLOR_WRITE);
@@ -3619,6 +3655,7 @@ plume::RenderRect ClampRect(const ClearRect *rect, uint32_t width, uint32_t heig
 
 void ClearStateLocked(const u8 *device_state, u32 flags, const ClearRect *rect,
                       const float color[4], float depth, u32 stencil) {
+  render_profile::Scope profile(render_profile::Stage::kClear);
   auto &s = State();
   if (!Video::EnsureCommandListLocked())
     return;
@@ -3657,7 +3694,10 @@ void ResolveStateLocked(const u8 *device_state, u32 flags, const ClearRect *sour
                         u32 dest_texture_va, const d3d::TextureFetchConstant *dest_format,
                         i32 dest_x, i32 dest_y, u32 dest_level, u32 dest_slice,
                         const float clear_color[4], float clear_depth, u32 clear_stencil) {
+  render_profile::Scope profile(render_profile::Stage::kResolve);
   auto &s = State();
+  static const uint32_t kProfileLabel = gpu_profile::Label("resolves");
+  gpu_profile::Mark(s, kProfileLabel);
   // Pending memexport results stay on the GPU: a resolve writes host textures
   // only, and a clear reads no memory.
   if (!Video::EnsureCommandListLocked())
@@ -3811,6 +3851,8 @@ bool ReadRenderTargetLocked(const u8 *device_state, u32 source, u32 &width, u32 
   height = std::min(height, surface->height);
   if (!width || !height)
     return false;
+  static const uint32_t kProfileLabel = gpu_profile::Label("render target readback");
+  gpu_profile::Mark(s, kProfileLabel);
 
   // A single-sampled copy of the rect, which the shader reads by its slot.
   const RenderScale scale = surface->scale;
