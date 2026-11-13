@@ -148,6 +148,11 @@ reNut rewrites `renut.toml` on exit: edit it only while the game is closed.
   had an empty `thirdparty/plume`); `ignore = dirty` on XenosRecomp, which
   `build.sh` patches.
 - `version.txt` (`0.0.0`): CMake reads it and upstream doesn't commit it.
+- **No reports to upstream's Sentry:** `CMakeLists.txt`'s `RENUT_UPSTREAM_SENTRY`
+  option (on by default, as upstream) holds upstream's DSN; `build.sh`
+  configures with it off. Without a DSN, RexCrash (upstream's crash and bug
+  reporter, which asks the player and sends to upstream's project) stays off.
+  Local crash dumps (`app/crash_dump`) are unaffected.
 - PGO: `deck/renut.profdata`, `build.sh --pgo-generate` / `--pgo-merge`,
   `deploy.sh`'s `APPIMAGE` override, `src/renut_engine/perf/pgo_dump.cpp`
   (see [Profile-guided build](#profile-guided-build-pgo)).

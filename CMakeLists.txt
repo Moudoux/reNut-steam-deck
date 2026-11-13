@@ -152,8 +152,15 @@ foreach(picture launcher_background workshop_background launcher_logo launcher_g
 endforeach()
 target_include_directories(renut PRIVATE "${renut_asset_dir}")
 include(thirdparty/RexCrash/CMakeLists.txt)
+# The Steam Deck fork's build (deck/build.sh) turns this off: without a DSN
+# RexCrash stays off, so no report goes to upstream's Sentry project.
+option(RENUT_UPSTREAM_SENTRY "Build with upstream's Sentry DSN (crash and bug reports)" ON)
+set(renut_sentry_dsn "")
+if(RENUT_UPSTREAM_SENTRY)
+    set(renut_sentry_dsn "https://953e4dacb8e759c2f49cc6dd5ba22a57@o4512343007952896.ingest.us.sentry.io/4512343096360960")
+endif()
 rexcrash_attach(renut
-    DSN "https://953e4dacb8e759c2f49cc6dd5ba22a57@o4512343007952896.ingest.us.sentry.io/4512343096360960"
+    DSN "${renut_sentry_dsn}"
     RELEASE "${RENUT_SENTRY_RELEASE}")
 target_compile_definitions(renut PRIVATE "RENUT_SENTRY_ENVIRONMENT=\"${RENUT_SENTRY_ENVIRONMENT}\"")
 include(cmake/sentry_symbols.cmake)
