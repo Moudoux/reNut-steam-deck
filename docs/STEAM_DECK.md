@@ -183,8 +183,8 @@ The fork patched SDK 0.10.0 (`deck/rexglue-sdk-v0.10.0-deck.patch`). SDK 0.11
   `shm_unlink`ed the mapping right after creating it. The SDK's
   `RemoveStaleFileMappings` (`src/base/memory_posix.cpp`, called from
   `kernel/memory.cpp` at startup) unlinks the mappings of dead processes.
-  [Checking a build](#checking-a-build) step 3 looks after a quit only; after a
-  killed session one mapping stays until the next start.
+  Seen on the Deck (2026-11-13): it does so even after a clean quit, so the last
+  session's mapping stays until the next start, which removes it.
 - **Audio worker spin:** `WaitMultiple` spun on `yield()` when a mutex was
   contended, and rounded its remaining time to milliseconds (under one became a
   zero sleep); the audio worker was ~21% of the game's CPU samples spinning
@@ -394,6 +394,14 @@ and reworked much of the renderer. What that meant for the fork:
   'rexfilesystem' not found`). Every `librex*.so` the SDK installed goes in.
 - **PGO:** `deck/renut.profdata` was made from the pre-rebase code, so most
   functions compile without it until a fresh `--pgo-generate` run.
+- **Checked on the Deck (2026-11-13), hub, standing:** 600–601 frames per 10 s,
+  GPU 10.4–10.8 ms per frame (5.9 ms of it the 1280x720 draws), render thread
+  2.24–2.46 µs per draw at ~4,900–5,300 draws (before: ~600, 10.2–10.5 ms, ~2.6
+  µs), no Steam keyboard, the old setting names applied. The first session
+  after deploying, the Deck just woken, ran 252–292 frames per 10 s with the
+  same draws: GPU 28–32 ms, 4.9–5.7 µs per draw, at once 2–3x on both sides.
+  Not explained (no Steam shader replay in the journal), and not seen in the
+  next session.
 
 ### Measured on the Deck (hub, standing, 2026-11-01)
 
@@ -484,7 +492,9 @@ On the Deck, after deploying:
 2. Standing in the hub: `Render thread profile` around 2.6 µs per draw and
    ~600 frames per 10 s, with no `Render thread spike` lines while standing
    still.
-3. After quitting: `ls /dev/shm/xenia_memory_*` finds nothing.
+3. With the game running: `ls /dev/shm/xenia_memory_*` finds only this
+   session's mapping (its pid in the name). SDK 0.11 leaves a session's mapping
+   after it quits and removes it at the next start.
 
 ## Next work
 
