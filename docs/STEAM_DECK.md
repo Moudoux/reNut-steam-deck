@@ -387,6 +387,11 @@ and reworked much of the renderer. What that meant for the fork:
     rewrote `src/renut_app.h` for `TitleApp`), before the UI system starts SDL.
   - `.gitmodules`: upstream deleted it (the gitlinks stay); ours is back.
   - Where upstream condensed a comment we had extended, ours stays.
+- **AppImage packs the SDK's modules** (`cmake/appimage.cmake`): SDK 0.11 loads
+  `rexfilesystem`, `rexhid`, `rexapu`, `rexui`, `rexgpu` and their drivers by
+  name at runtime, and linuxdeploy follows only what `renut` links, so
+  upstream's AppImage left them out and stopped at startup (`module
+  'rexfilesystem' not found`). Every `librex*.so` the SDK installed goes in.
 - **PGO:** `deck/renut.profdata` was made from the pre-rebase code, so most
   functions compile without it until a fresh `--pgo-generate` run.
 
