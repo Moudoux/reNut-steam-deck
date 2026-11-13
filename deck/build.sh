@@ -143,10 +143,11 @@ if [ -f "$BUILD/CMakeCache.txt" ] && [ "$(cat "$SDK_STAMP" 2>/dev/null)" != "$SD
   echo "== SDK changed: configuring from scratch"
   rm -rf "$BUILD/CMakeCache.txt" "$BUILD/CMakeFiles"
 fi
-if ! grep -qxF "CMAKE_CXX_FLAGS:STRING=$FLAGS" "$BUILD/CMakeCache.txt" 2>/dev/null; then
+if ! grep -qxF "CMAKE_CXX_FLAGS:STRING=$FLAGS" "$BUILD/CMakeCache.txt" 2>/dev/null ||
+   ! grep -qxF "RENUT_UPSTREAM_SENTRY:BOOL=OFF" "$BUILD/CMakeCache.txt"; then
   echo "== configure"
   run cmake --preset linux-amd64-release -B "$BUILD" -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
-      -Drexglue_DIR=/sdk/out/install/linux-amd64/lib/cmake/rexglue \
+      -Drexglue_DIR=/sdk/out/install/linux-amd64/lib/cmake/rexglue -DRENUT_UPSTREAM_SENTRY=OFF \
       "-DCMAKE_C_FLAGS=$FLAGS" "-DCMAKE_CXX_FLAGS=$FLAGS"
   echo "$SDK_COMMIT" > "$SDK_STAMP"
 fi
