@@ -65,12 +65,18 @@ in the container with the same mounts.
 ### Profile-guided build (PGO)
 
 The build compiles with `deck/renut.profdata`, a profile of what runs most in
-a play session on the Deck (clang `-fprofile-use`; a change of flags
-reconfigures and rebuilds everything). Made 2026-11-01 from ~4 minutes of
-the hub, a world and driving.
+a play session on the Deck (clang `-fprofile-use`). `build.sh` compiles with
+a copy named by the profile's hash (`out/pgo-use/`), so a new profile changes
+the flags, which reconfigures and rebuilds everything (Ninja doesn't see the
+profile itself as an input). Made again 2026-11-13, after the rebase onto
+upstream 2d0edaa, from 5–10 minutes of the hub, a world and driving.
 
 - Render thread, hub: 2.75–2.88 → 2.47–2.64 µs per draw; the area after it
-  3.39–3.95 → 3.20–3.69. The GPU is unchanged.
+  3.39–3.95 → 3.20–3.69. The GPU is unchanged. (First profile, 2026-11-01.)
+- The 2026-11-13 profile, hub, standing: 601 frames / 10 s, GPU 10.5–10.8 ms,
+  render thread 2.26–2.33 µs per draw at 5,200–5,400 draws (the pre-rebase
+  profile on the rebased code: 600–601, 10.4–10.8 ms, 2.24–2.46 µs). The
+  `-Wbackend-plugin` hash-mismatch warnings went from 110 to 0.
 - Code changed since the profile is compiled as without one. Make it again
   after large changes (an upstream rebase, say):
   1. `deck/build.sh --pgo-generate`: an instrumented build in
