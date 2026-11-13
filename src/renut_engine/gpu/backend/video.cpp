@@ -9,6 +9,7 @@
 #include "renut_engine/perf/frame_stats.h"
 #include "renut_engine/gpu/backend/backend.h"
 #include "renut_engine/gpu/backend/command_recorder.h"
+#include "renut_engine/gpu/backend/gpu_profile.h"
 #include "renut_engine/gpu/backend/native_window.h"
 #include "renut_engine/gpu/render/pipeline.h"
 #include "renut_engine/gpu/backend/render_thread.h"
@@ -370,6 +371,7 @@ void CollectGpuTime(VideoState &s, uint32_t slot) {
 } // namespace
 
 void BeginListTiming(VideoState &s) {
+  gpu_profile::BeginList(s);
   s.timing_open = false;
   plume::RenderQueryPool *pool = s.timestamps[s.frame].get();
   uint32_t &lists = s.timed_lists[s.frame];
@@ -384,6 +386,7 @@ void BeginListTiming(VideoState &s) {
 }
 
 void EndListTiming(VideoState &s, bool last_in_frame) {
+  gpu_profile::EndList(s, last_in_frame);
   plume::RenderQueryPool *pool = s.timestamps[s.frame].get();
   if (!pool || !s.timing_open)
     return;
@@ -410,6 +413,7 @@ void WaitSlotLocked(VideoState &s, uint32_t slot) {
   s.submit_calls[slot] = 0;
   s.submitted[slot] = false;
   CollectGpuTime(s, slot);
+  gpu_profile::Collect(s, slot);
 }
 
 void WaitAllSubmitted(VideoState &s) {

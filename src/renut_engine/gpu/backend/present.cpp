@@ -11,6 +11,7 @@
 #include "renut_engine/gpu/backend/backend.h"
 #include "renut_engine/gpu/backend/command_recorder.h"
 #include "renut_engine/gpu/backend/frame_blur.h"
+#include "renut_engine/gpu/backend/gpu_profile.h"
 #include "renut_engine/gpu/backend/smaa.h"
 #include "renut_engine/gpu/render/draw.h"
 #include "renut_engine/gpu/render/graphics_options.h"
@@ -204,6 +205,8 @@ void PresentLocked(VideoState &s, const PresentImage *image) {
 
   if (!Video::EnsureCommandListLocked())
     return;
+  static const uint32_t kProfileLabel = gpu_profile::Label("present and overlays");
+  gpu_profile::Mark(s, kProfileLabel);
   plume::RenderCommandList *cmd = s.command_list;
   // SMAA's passes come before the back buffer's (their own targets).
   PresentImage scan;

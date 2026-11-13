@@ -39,6 +39,10 @@ struct HostSurface {
   // resolves); made on first use, see SurfaceSampleSlotLocked.
   std::unique_ptr<plume::RenderTextureView> sample_view;
   uint32_t sample_slot = UINT32_MAX;
+
+  // gpu_profile labels of draws with it as the first target: color only,
+  // color with depth, depth only. Made on first use.
+  uint32_t profile_labels[3] = {UINT32_MAX, UINT32_MAX, UINT32_MAX};
 };
 
 // Host pixels per guest pixel of every render target and resolve destination,

@@ -10,6 +10,7 @@
 #include <rex/types.h>
 
 #include "renut_engine/gpu/backend/backend.h"
+#include "renut_engine/gpu/backend/gpu_profile.h"
 #include "renut_engine/gpu/backend/video.h"
 #include "renut_engine/gpu/guest/guest_memory.h"
 #include "renut_engine/gpu/render/format.h"
@@ -310,6 +311,9 @@ bool ApplyAmbientOcclusionLocked(HostSurface *depth, HostTexture *resolved, int3
       return false;
     }
   }
+  static const uint32_t kProfileLabel = gpu_profile::Label("ambient occlusion");
+  gpu_profile::Mark(s, kProfileLabel);
+
   AmbientOcclusionPush push{};
   push.scale[0] = push.scale[1] = 1.0f;
   push.depth_index = resolved->slot;

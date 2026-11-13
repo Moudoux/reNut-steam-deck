@@ -214,9 +214,11 @@ function(renut_gpu_setup TARGET)
         ${RENUT_GPU_DIR}/backend/backend.cpp
         ${RENUT_GPU_DIR}/backend/command_recorder.cpp
         ${RENUT_GPU_DIR}/backend/frame_blur.cpp
+        ${RENUT_GPU_DIR}/backend/gpu_profile.cpp
         ${RENUT_GPU_DIR}/backend/native_window.cpp
         ${RENUT_GPU_DIR}/backend/present.cpp
         ${RENUT_GPU_DIR}/backend/queued.cpp
+        ${RENUT_GPU_DIR}/backend/render_profile.cpp
         ${RENUT_GPU_DIR}/backend/render_thread.cpp
         ${RENUT_GPU_DIR}/backend/smaa.cpp
         ${RENUT_GPU_DIR}/backend/video.cpp
