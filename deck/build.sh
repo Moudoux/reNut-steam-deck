@@ -40,8 +40,16 @@ PGO_DECK_DIR=/tmp/renut-pgo
 if [ "${1:-}" = "--pgo-generate" ]; then
   BUILD="$ROOT/out/build/linux-amd64-release-pgo-generate"
   FLAGS="$FLAGS -fprofile-generate=$PGO_DECK_DIR"
-elif [ -f "$PGO_PROFILE" ]; then
-  FLAGS="$FLAGS -fprofile-use=$PGO_PROFILE -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+elif [ -f "$PGO_PROFILE" ] && [ "${1:-}" != "--pgo-merge" ]; then
+  # Ninja doesn't see the profile as an input, so compile with a copy named by
+  # its hash: a new profile changes the flags, which reconfigures and rebuilds.
+  PGO_HASH="$(sha256sum "$PGO_PROFILE" | cut -c1-16)"
+  PGO_USE="$ROOT/out/pgo-use/renut-$PGO_HASH.profdata"
+  if [ ! -f "$PGO_USE" ]; then
+    rm -rf "$ROOT/out/pgo-use" && mkdir -p "$ROOT/out/pgo-use"
+    cp "$PGO_PROFILE" "$PGO_USE"
+  fi
+  FLAGS="$FLAGS -fprofile-use=$PGO_USE -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
 fi
 
 # assets/Bundle may be a symlink to the game's extracted Bundle elsewhere: the
