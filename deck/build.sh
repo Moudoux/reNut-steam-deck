@@ -15,8 +15,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SDK="$ROOT/out/rexglue-sdk"
-SDK_COMMIT=c94f5eb   # "Release v0.10.0" (renut_manifest.toml's sdk_version)
+# renut_manifest.toml's sdk_version 0.11.0 is no release: rexglue-sdk's
+# development branch. cf76aa0a is the last commit that still generates
+# generated/rexglue.cmake, which CMakeLists.txt includes (351bc94d drops it).
+# One folder per commit, so changing the pin builds the new SDK beside the old.
+SDK_COMMIT=cf76aa0a
+SDK="$ROOT/out/rexglue-sdk-$SDK_COMMIT"
 IMAGE=renut-deck-build
 BUILD="$ROOT/out/build/linux-amd64-release"
 DXC_URL=https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/linux_dxc_2026_09_28.x86_x64.tar.gz
@@ -77,22 +81,21 @@ if [ "${1:-}" = "--shell" ]; then
   exit
 fi
 
-# The SDK, from source with deck/rexglue-sdk-v0.10.0-deck.patch (threading
-# spins, /dev/shm leak). Kept in out/ (gitignored) and installed into
-# out/rexglue-sdk/out/install/linux-amd64.
+# The SDK, from source, unpatched (0.11 fixed what the 0.10 patch did: see
+# docs/STEAM_DECK.md). Kept in out/ (gitignored) and installed into
+# out/rexglue-sdk-<commit>/out/install/linux-amd64.
 if [ ! -d "$SDK/.git" ]; then
   echo "== clone rexglue-sdk $SDK_COMMIT"
-  git clone --recursive https://github.com/rexglue/rexglue-sdk "$SDK"
+  git clone https://github.com/rexglue/rexglue-sdk "$SDK"
   git -C "$SDK" checkout "$SDK_COMMIT"
   git -C "$SDK" submodule update --init --recursive
-  git -C "$SDK" apply "$ROOT/deck/rexglue-sdk-v0.10.0-deck.patch"
 fi
 if [ ! -f "$SDK/out/install/linux-amd64/lib/cmake/rexglue/rexglueConfig.cmake" ] ||
-   [ -n "$(find "$SDK/src" "$SDK/include" -newer "$SDK/out/install/linux-amd64/lib/librexruntime.so" -print -quit 2>/dev/null)" ]; then
+   [ -n "$(find "$SDK/src" "$SDK/include" -newer "$SDK/out/install/linux-amd64/lib/librexbase.so" -print -quit 2>/dev/null)" ]; then
   echo "== build rexglue-sdk (Release)"
   docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$SDK:/sdk" -w /sdk "$IMAGE" bash -c "
     [ -f out/build/linux-amd64/CMakeCache.txt ] ||
-      cmake --preset linux-amd64 -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
+      cmake --preset linux-amd64 -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 -DREXGLUE_BUILD_TESTS=OFF \
             '-DCMAKE_C_FLAGS=-march=znver2 -ffp-contract=off' '-DCMAKE_CXX_FLAGS=-march=znver2 -ffp-contract=off'
     cmake --build out/build/linux-amd64 --config Release --target install --parallel"
 fi
@@ -133,12 +136,19 @@ done
 echo "== codegen"
 run /sdk/out/install/linux-amd64/bin/rexglue codegen renut_manifest.toml
 
-# Configured again when the flags change (a profile added, say).
+# Configured again when the flags change (a profile added, say), and from
+# scratch when the SDK does: the cache keeps the old one's paths (Vulkan's).
+SDK_STAMP="$BUILD/rexglue-sdk.commit"
+if [ -f "$BUILD/CMakeCache.txt" ] && [ "$(cat "$SDK_STAMP" 2>/dev/null)" != "$SDK_COMMIT" ]; then
+  echo "== SDK changed: configuring from scratch"
+  rm -rf "$BUILD/CMakeCache.txt" "$BUILD/CMakeFiles"
+fi
 if ! grep -qxF "CMAKE_CXX_FLAGS:STRING=$FLAGS" "$BUILD/CMakeCache.txt" 2>/dev/null; then
   echo "== configure"
   run cmake --preset linux-amd64-release -B "$BUILD" -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 \
       -Drexglue_DIR=/sdk/out/install/linux-amd64/lib/cmake/rexglue \
       "-DCMAKE_C_FLAGS=$FLAGS" "-DCMAKE_CXX_FLAGS=$FLAGS"
+  echo "$SDK_COMMIT" > "$SDK_STAMP"
 fi
 
 # XenosRecomp configured without TBB (an image without it) compiles the
