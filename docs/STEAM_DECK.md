@@ -2,8 +2,9 @@
 
 This fork of [masterspike52/reNut](https://github.com/masterspike52/reNut) is
 built for one target: the Steam Deck (Zen 2 CPU, RDNA 2 GPU, 15 W shared
-power, SteamOS). It carries build tooling, renderer work and Rexglue SDK fixes
-that make the game run at a steady 60 FPS there. This page is the record of
+power, SteamOS). It carries build tooling and renderer work that make the game
+run at a steady 60 FPS there (and carried Rexglue SDK fixes until the SDK made
+them itself). This page is the record of
 all of it: read it before changing the renderer, the build, or rebasing.
 
 ## Rebasing on upstream: keep every change listed here
@@ -18,9 +19,17 @@ Upstream moves fast. When rebasing or merging upstream's `main`:
 - `deck/xenosrecomp-deck.patch` must still apply to the XenosRecomp commit
   upstream's submodule pins: when upstream moves it, carry the patch over,
   hunk by hunk, unless upstream fixed the same thing.
-- The SDK patch (`deck/rexglue-sdk-v0.10.0-deck.patch`) must be carried to any
-  new SDK version upstream moves to (`renut_manifest.toml`'s `sdk_version`),
-  hunk by hunk, unless the SDK fixed the same thing.
+- When upstream moves to another SDK (`renut_manifest.toml`'s `sdk_version`),
+  move `deck/build.sh`'s `SDK_COMMIT` with it. There is no SDK patch since 0.11
+  (see [Rexglue SDK](#rexglue-sdk-no-patch-since-011)); check that what it fixed
+  stays fixed.
+- Don't rebase with a plain `git rebase upstream/main` when upstream deletes code
+  our commits touch: git silently auto-merges away our lines (the profiler's
+  `stages.Enter(...)`) wherever upstream deleted their surroundings, and only some
+  show as conflicts. Restore what we depend on in a commit on top of upstream
+  first, `git rebase --onto <it> <old base>`, then check per commit that every
+  line it added survived (the 2026-11 rebase did, see
+  [Rebased onto upstream 2d0edaa](#rebased-onto-upstream-2d0edaa-2026-11-13)).
 - After a rebase, build with `deck/build.sh` and check on the Deck
   ([Checking a build](#checking-a-build)).
 
@@ -33,9 +42,13 @@ Add `upstream` once: `git remote add upstream https://github.com/masterspike52/r
 - **Why a container:** glibc 2.39 there is below SteamOS's, so the binary
   runs on the Deck. A build on the host (Arch, glibc 2.44) fails on the Deck
   with `GLIBC_2.4x not found`.
-- **Rexglue SDK:** clones v0.10.0 (commit `c94f5eb`) into `out/rexglue-sdk`,
-  applies `deck/rexglue-sdk-v0.10.0-deck.patch`, and builds and installs it
-  (Release, Zen 2 flags).
+- **Rexglue SDK:** clones the SDK's `development` branch at `cf76aa0a` into
+  `out/rexglue-sdk-cf76aa0a` and builds and installs it (Release, Zen 2 flags,
+  no tests), unpatched. Upstream's `sdk_version = "0.11.0"` is no release: it is
+  that branch, and `cf76aa0a` is its last commit that still generates
+  `generated/rexglue.cmake`, which `CMakeLists.txt` includes (`351bc94d` drops
+  it). The image carries the LunarG Vulkan SDK (1.4.363.1, as the SDK's CI):
+  0.11 wants Vulkan headers 1.4.313+ and VMA, and Ubuntu's are 1.3.275.
 - **XenosRecomp:** initialises upstream's submodule (recursively) and applies
   `deck/xenosrecomp-deck.patch`.
 - **DXC:** downloads Microsoft's Linux release (1.9.2609) over the one the
@@ -129,8 +142,8 @@ reNut rewrites `renut.toml` on exit: edit it only while the game is closed.
 ### Build and repository
 
 - `deck/`: Dockerfile, `build.sh` (rebuilds the image when the Dockerfile
-  changes; reconfigures a XenosRecomp built without TBB), `deploy.sh`, the SDK
-  patch, `stfs_extract.py`.
+  changes; reconfigures a XenosRecomp built without TBB), `deploy.sh`,
+  `stfs_extract.py`.
 - `.gitmodules`: plume (upstream had the gitlink without the entry, so a clone
   had an empty `thirdparty/plume`); `ignore = dirty` on XenosRecomp, which
   `build.sh` patches.
@@ -158,24 +171,29 @@ To change it: edit the files there, then
 
 Result: the shader cache step went from ~30 min on one core to minutes.
 
-### Rexglue SDK (`deck/rexglue-sdk-v0.10.0-deck.patch`)
+### Rexglue SDK: no patch since 0.11
 
-- **`/dev/shm` leak:** `memory_posix.cpp` now `shm_unlink`s the guest memory
-  right after creating it. Before, every session the game didn't close
-  cleanly (Steam kills it) left a ~470 MB `/dev/shm/xenia_memory_*`. After
-  about a dozen sessions new ones died of SIGBUS at startup and took
-  Steam's UI down with them.
-- **Audio worker spin:** `threading_posix.cpp` `WaitMultiple` backs off with
-  short sleeps when a mutex is contended (it spun on `yield()`), and counts
-  its remaining time in microseconds. Rounded to milliseconds, under one
-  became a zero sleep, i.e. a spin. The alertable wait's slice rounds up for
-  the same reason. The audio worker was ~21% of the game's CPU samples
-  spinning in here.
-- **Timer thread spin:** `timer_queue.cpp` uses disruptorplus's
-  `blocking_wait_strategy` instead of `spin_wait_strategy`.
-- **Library bug:** disruptorplus's `blocking_wait_strategy.hpp` passed
-  `wait_for`/`wait_until` the time and predicate in the wrong order. It
-  had never been compiled.
+The fork patched SDK 0.10.0 (`deck/rexglue-sdk-v0.10.0-deck.patch`). SDK 0.11
+(`cf76aa0a`) fixes all four of its items itself, so the patch is gone
+(2026-11-13); the source moved from `src/core/` to `src/base/`:
+
+- **`/dev/shm` leak:** every session the game didn't close cleanly (Steam kills
+  it) left a ~470 MB `/dev/shm/xenia_memory_*`; after about a dozen, new ones
+  died of SIGBUS at startup and took Steam's UI down with them. Ours
+  `shm_unlink`ed the mapping right after creating it. The SDK's
+  `RemoveStaleFileMappings` (`src/base/memory_posix.cpp`, called from
+  `kernel/memory.cpp` at startup) unlinks the mappings of dead processes.
+  [Checking a build](#checking-a-build) step 3 looks after a quit only; after a
+  killed session one mapping stays until the next start.
+- **Audio worker spin:** `WaitMultiple` spun on `yield()` when a mutex was
+  contended, and rounded its remaining time to milliseconds (under one became a
+  zero sleep); the audio worker was ~21% of the game's CPU samples spinning
+  there. The SDK rewrote it: it locks in address order and blocks in
+  `Waiter::WaitChange` (a condition variable's `wait_until(deadline)`).
+- **Timer thread spin:** the timer queue used disruptorplus's
+  `spin_wait_strategy`. It now waits on a condition variable (`wait` /
+  `wait_until`), and disruptorplus is gone, with its
+  `blocking_wait_strategy.hpp` argument-order bug.
 
 ### reNut
 
@@ -330,6 +348,48 @@ Result: the shader cache step went from ~30 min on one core to minutes.
     per frame, and the 8 that cost most, each with its hashes, changes,
     uploads, unlocks and mode (lock-driven, dynamic).
 
+### Rebased onto upstream 2d0edaa (2026-11-13)
+
+Upstream moved to SDK 0.11 (`rex::app::TitleApp`, `REX_SETTING`, `REXLOG_CATEGORY`)
+and reworked much of the renderer. What that meant for the fork:
+
+- **Profilers kept by the fork now** (first commit on top of upstream): upstream
+  deleted `gpu/backend/gpu_profile.*`, `render_profile.*`, `gpu/log.h` (the
+  `RGPU_*` macros) and every call site (e59bb5f). They are back, ported:
+  - The settings are `REX_SETTING`s in the `renut` scope, so they are
+    `renut.renut_gpu_profile` and so on; the old names still work (aliases, the
+    log says "… is now …"), so `renut.toml` needs no change.
+  - The log category is `renut_gpu` (added in `RenutApp::OnConfigure`), and
+    `fmt::format` is `std::format` (0.11 has no fmt).
+  - Every call site is back in upstream's new code: GPU labels in present,
+    SMAA, ambient occlusion, draws per target, exported streams, depth
+    resolves, resolves, readback, texture uploads and resolve mips;
+    `BeginList`/`EndList`/`Collect` in `video.cpp`, `FrameDone` in
+    `render_thread.cpp`, the draw stages and the clear and resolve scopes in
+    `draw.cpp`.
+  - Upstream's own renderer warnings that went with `gpu/log.h` (evictions,
+    unsupported formats, rectangle lists, ...) are not restored: only what
+    our work logs.
+- **Taken from upstream, ours dropped:**
+  - Async pipelines (`TakeAsync`, `renut_async_pipelines`) and the jiggy wall
+    hold (`game/jiggy_wall_hold.cpp`): upstream removed both. Our only line in
+    them was the geometry trace's "left out" count, now gone; the trace still
+    shows the wall's words. No `Jiggy wall: held shut` lines any more.
+  - The memory report (`memory_report.cpp`, `ShaderCacheHostBytes`): removed
+    upstream.
+  - The SDK patch: see [Rexglue SDK](#rexglue-sdk-no-patch-since-011).
+- **Reworked onto upstream's code:**
+  - `SharedConstants`: upstream added user clip planes at 1360 and 1456 (read by
+    its host shaders) with 8 bytes of padding at 1352; `tessellation_patches`
+    (8 bytes, read by XenosRecomp's shaders at 1352) takes the padding's place.
+    The size stays 1472.
+  - The Steam keyboard hint moved into `RenutApp`'s constructor (upstream
+    rewrote `src/renut_app.h` for `TitleApp`), before the UI system starts SDL.
+  - `.gitmodules`: upstream deleted it (the gitlinks stay); ours is back.
+  - Where upstream condensed a comment we had extended, ours stays.
+- **PGO:** `deck/renut.profdata` was made from the pre-rebase code, so most
+  functions compile without it until a fresh `--pgo-generate` run.
+
 ### Measured on the Deck (hub, standing, 2026-11-01)
 
 | | Start | Now |
@@ -378,8 +438,8 @@ under Next work.
   append; past 5 MB it rotates to `renut.1.log` (a run with the geometry trace can
   start in that one).
   A spike's ms is the render thread's work since the game last queued a
-  frame: when the game queues none for a while (a load held by the jiggy
-  wall, `Jiggy wall: held shut …`), all of it shows as one long "frame".
+  frame: when the game queues none for a while (a long load), all of it shows
+  as one long "frame".
 - **CPU samples:**
   - Find the render thread: the `[tNNN]` of `GPU profile:` lines.
   - Record: `perf record -F 499 --call-graph dwarf,16384 -t <tid> -o /tmp/x.data -- sleep 8`.
@@ -431,7 +491,7 @@ the same day (perf over a hub → workshop → hub round trip, and the logs).
 1. **A ~780 ms frame at the end of the workshop's load: not a hitch.**
    The 779.7 ms "frame" (9,416 draws, 16:06:23) came right after `Jiggy
    wall: held shut 17438 ms for the world's pipelines`: the wall
-   (`game/jiggy_wall_hold.cpp`, upstream) kept the load going while the
+   (`game/jiggy_wall_hold.cpp`, upstream's, removed upstream in 2026-11) kept the load going while the
    world's pipelines built, the game queued no frame meanwhile, and the
    spike log summed the render thread's 17 s of work as one frame (the
    10 s profile line due then came out at the same moment, over 169 frames).

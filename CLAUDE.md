@@ -8,8 +8,8 @@ deploy, profiling workflow, and the list of everything this fork changes.
 ## Rules
 
 - **Rebasing/merging upstream must not lose any change listed in
-  docs/STEAM_DECK.md ("What this fork changes")**, including the patches
-  `deck/rexglue-sdk-v0.10.0-deck.patch` and `deck/xenosrecomp-deck.patch`. Drop one of ours only when upstream
+  docs/STEAM_DECK.md ("What this fork changes")**, including
+  `deck/xenosrecomp-deck.patch`. Drop one of ours only when upstream
   fixed the same problem, and update the doc when you do.
 - Document every new fork change in docs/STEAM_DECK.md in the same commit.
 - Build only with `deck/build.sh` (Ubuntu 24.04 container: the host's glibc is

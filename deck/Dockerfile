@@ -19,3 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 200 \
  && update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 200 \
  && git config --global --add safe.directory '*' && rm -rf /var/lib/apt/lists/*
+# rexglue-sdk 0.11 wants Vulkan headers 1.4.313+ and VMA from the LunarG Vulkan
+# SDK (Ubuntu's are 1.3.275): the release its CI uses (setup-toolchain).
+ARG VULKAN_SDK_VERSION=1.4.363.1
+RUN apt-get update && apt-get install -y --no-install-recommends xz-utils && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /opt/vulkan \
+ && curl -fsSL "https://sdk.lunarg.com/sdk/download/${VULKAN_SDK_VERSION}/linux/vulkan_sdk.tar.xz" \
+    | tar -xJ -C /opt/vulkan
+ENV VULKAN_SDK=/opt/vulkan/${VULKAN_SDK_VERSION}/x86_64
