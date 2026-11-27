@@ -42,12 +42,14 @@ Add `upstream` once: `git remote add upstream https://github.com/masterspike52/r
 - **Why a container:** glibc 2.39 there is below SteamOS's, so the binary
   runs on the Deck. A build on the host (Arch, glibc 2.44) fails on the Deck
   with `GLIBC_2.4x not found`.
-- **Rexglue SDK:** clones the SDK's `development` branch at `cf76aa0a` into
-  `out/rexglue-sdk-cf76aa0a` and builds and installs it (Release, Zen 2 flags,
-  no tests), unpatched. Upstream's `sdk_version = "0.11.0"` is no release: it is
-  that branch, and `cf76aa0a` is its last commit that still generates
-  `generated/rexglue.cmake`, which `CMakeLists.txt` includes (`351bc94d` drops
-  it). The image carries the LunarG Vulkan SDK (1.4.363.1, as the SDK's CI):
+- **Rexglue SDK:** clones the SDK at `d0f5fccd` (`nightly-20261126-d0f5fccd`,
+  `development` branch, 0.12.0) into `out/rexglue-sdk-d0f5fccd` and builds and
+  installs it (Release, Zen 2 flags, no tests), unpatched. Upstream names no SDK
+  build (`sdk_version = "0.11.0"`, and `find_package(rexglue 0.11.0)` takes any
+  0.x); its code needs `rex::SettingMode` (SDK `92d46161`, after the `v0.11.0`
+  tag), so the pin is the last nightly before upstream's commit. Before
+  2026-11-27 the pin was `cf76aa0a`, the last commit generating
+  `generated/rexglue.cmake`, which upstream's `CMakeLists.txt` included. The image carries the LunarG Vulkan SDK (1.4.363.1, as the SDK's CI):
   0.11 wants Vulkan headers 1.4.313+ and VMA, and Ubuntu's are 1.3.275.
 - **XenosRecomp:** initialises upstream's submodule (recursively) and applies
   `deck/xenosrecomp-deck.patch`.
@@ -148,8 +150,10 @@ reNut rewrites `renut.toml` on exit: edit it only while the game is closed.
 ### Build and repository
 
 - `deck/`: Dockerfile, `build.sh` (rebuilds the image when the Dockerfile
-  changes; reconfigures a XenosRecomp built without TBB), `deploy.sh`,
-  `stfs_extract.py`.
+  changes; reconfigures a XenosRecomp built without TBB; runs the containers
+  as root under rootless Docker, where `-u <uid>` maps to a subordinate uid
+  that can't write the mounted folders, and as the user's ids otherwise),
+  `deploy.sh`, `stfs_extract.py`.
 - `.gitmodules`: plume (upstream had the gitlink without the entry, so a clone
   had an empty `thirdparty/plume`); `ignore = dirty` on XenosRecomp, which
   `build.sh` patches.
@@ -186,7 +190,8 @@ Result: the shader cache step went from ~30 min on one core to minutes.
 
 The fork patched SDK 0.10.0 (`deck/rexglue-sdk-v0.10.0-deck.patch`). SDK 0.11
 (`cf76aa0a`) fixes all four of its items itself, so the patch is gone
-(2026-11-13); the source moved from `src/core/` to `src/base/`:
+(2026-11-13); the source moved from `src/core/` to `src/base/`. Checked again
+for `d0f5fccd` (pinned 2026-11-27): all three below are unchanged.
 
 - **`/dev/shm` leak:** every session the game didn't close cleanly (Steam kills
   it) left a ~470 MB `/dev/shm/xenia_memory_*`; after about a dozen, new ones
@@ -402,7 +407,8 @@ and reworked much of the renderer. What that meant for the fork:
   `rexfilesystem`, `rexhid`, `rexapu`, `rexui`, `rexgpu` and their drivers by
   name at runtime, and linuxdeploy follows only what `renut` links, so
   upstream's AppImage left them out and stopped at startup (`module
-  'rexfilesystem' not found`). Every `librex*.so` the SDK installed goes in.
+  'rexfilesystem' not found`). Every `librex*.so` the SDK installed went in.
+  Dropped 2026-11-27: upstream packs them itself now (see fd58b99 below).
 - **PGO:** `deck/renut.profdata` was made from the pre-rebase code, so most
   functions compile without it until a fresh `--pgo-generate` run.
 - **Checked on the Deck (2026-11-13), hub, standing:** 600–601 frames per 10 s,
@@ -413,6 +419,32 @@ and reworked much of the renderer. What that meant for the fork:
   same draws: GPU 28–32 ms, 4.9–5.7 µs per draw, at once 2–3x on both sides.
   Not explained (no Steam shader replay in the journal), and not seen in the
   next session.
+
+### Rebased onto upstream fd58b99 (2026-11-27)
+
+Upstream added NutTool (`src/nuttool/`), an arcade API, an audio driver and
+RexFabric's avatar editor, and builds against the SDK's `v0.11.0` release.
+What that meant for the fork:
+
+- **SDK pin moved** to `d0f5fccd` (a 0.12.0 nightly): upstream's
+  `CMakeLists.txt` calls `rexglue_project` (`cf76aa0a` lacks it), and its
+  settings code uses `rex::SettingMode`, which the `v0.11.0` tag lacks too
+  (that build stopped in `graphics_menu.cpp`). What
+  [Rexglue SDK](#rexglue-sdk-no-patch-since-011) lists is still fixed there.
+- **`draw.cpp`:** upstream's NutTool world-draw log (`world_stage`,
+  `NoteWorldDrawKind`) sits beside our profiler stages and per-draw GPU
+  labels; both kept.
+- **AppImage, ours dropped:** the newer SDK's `rexglue_project` copies its
+  modules beside `renut`, and upstream's `appimage.cmake` now packs every
+  `.so` there into `usr/lib` (one copy each, a link in `usr/bin`), leaving out
+  the Xenos GPU modules (`librexgpu-xenos-*`, unused by the native renderer).
+  Our `--library` list of every installed `librex*.so` did the same job and
+  put the Xenos ones back in, so `cmake/appimage.cmake` is upstream's again.
+- **`renut_manifest.toml`:** this SDK's `rexglue codegen` (run by `build.sh`)
+  rewrites `sdk_version` to `0.12.0`. Leave it uncommitted
+  (`git checkout renut_manifest.toml`): upstream's `0.11.0` builds the same.
+- Plain `git rebase`: upstream deleted nothing around our lines; every line
+  the fork added was checked to be in the result.
 
 ### Measured on the Deck (hub, standing, 2026-11-01)
 

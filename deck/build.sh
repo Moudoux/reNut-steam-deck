@@ -15,11 +15,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# renut_manifest.toml's sdk_version 0.11.0 is no release: rexglue-sdk's
-# development branch. cf76aa0a is the last commit that still generates
-# generated/rexglue.cmake, which CMakeLists.txt includes (351bc94d drops it).
+# Upstream names no SDK build: its code (rex::SettingMode, 92d46161) needs the
+# development branch (0.12.0, which find_package(rexglue 0.11.0) accepts).
+# d0f5fccd is the nightly (nightly-20261126-d0f5fccd) before upstream's fd58b99.
 # One folder per commit, so changing the pin builds the new SDK beside the old.
-SDK_COMMIT=cf76aa0a
+SDK_COMMIT=d0f5fccd
 SDK="$ROOT/out/rexglue-sdk-$SDK_COMMIT"
 IMAGE=renut-deck-build
 BUILD="$ROOT/out/build/linux-amd64-release"
@@ -60,8 +60,16 @@ if [ -L "$ROOT/assets/Bundle" ]; then
   GAME_MOUNT=(-v "$target:$target:ro")
 fi
 
+# Rootless Docker maps container root to this user and any other uid to a
+# subordinate one, which can't write the mounted folders: run as root there.
+# A rootful daemon gets this user's ids, so the files stay theirs.
+USER_ARGS=(-u "$(id -u):$(id -g)")
+if docker info -f '{{.SecurityOptions}}' 2>/dev/null | grep -q rootless; then
+  USER_ARGS=()
+fi
+
 run() {
-  docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
+  docker run --rm "${USER_ARGS[@]}" -e HOME=/tmp \
     -v "$SDK:/sdk" -v "$ROOT:$ROOT" "${GAME_MOUNT[@]}" -w "$ROOT" "$IMAGE" "$@"
 }
 
@@ -84,7 +92,7 @@ if [ "${1:-}" = "--pgo-merge" ]; then
 fi
 
 if [ "${1:-}" = "--shell" ]; then
-  docker run --rm -it -u "$(id -u):$(id -g)" -e HOME=/tmp \
+  docker run --rm -it "${USER_ARGS[@]}" -e HOME=/tmp \
     -v "$SDK:/sdk" -v "$ROOT:$ROOT" "${GAME_MOUNT[@]}" -w "$ROOT" "$IMAGE" bash
   exit
 fi
@@ -101,7 +109,7 @@ fi
 if [ ! -f "$SDK/out/install/linux-amd64/lib/cmake/rexglue/rexglueConfig.cmake" ] ||
    [ -n "$(find "$SDK/src" "$SDK/include" -newer "$SDK/out/install/linux-amd64/lib/librexbase.so" -print -quit 2>/dev/null)" ]; then
   echo "== build rexglue-sdk (Release)"
-  docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -v "$SDK:/sdk" -w /sdk "$IMAGE" bash -c "
+  docker run --rm "${USER_ARGS[@]}" -e HOME=/tmp -v "$SDK:/sdk" -w /sdk "$IMAGE" bash -c "
     [ -f out/build/linux-amd64/CMakeCache.txt ] ||
       cmake --preset linux-amd64 -DCMAKE_C_COMPILER=clang-20 -DCMAKE_CXX_COMPILER=clang++-20 -DREXGLUE_BUILD_TESTS=OFF \
             '-DCMAKE_C_FLAGS=-march=znver2 -ffp-contract=off' '-DCMAKE_CXX_FLAGS=-march=znver2 -ffp-contract=off'

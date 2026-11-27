@@ -55,24 +55,6 @@ if(TARGET rexcrashreporter_project)
 endif()
 set(renut_appimage "${CMAKE_BINARY_DIR}/renut-x86_64.AppImage")
 
-# The SDK loads its modules (rexfilesystem, rexhid, rexapu, rexui, rexgpu and
-# their drivers: rexapu-sdl3, rexhid-sdl3, rexui-sdl3, ...) by name at runtime,
-# so linuxdeploy, which follows only what renut links, would leave them out and
-# renut stops at startup ("module 'rexfilesystem' not found"). Every module the
-# SDK installed goes in, with what they link.
-set(renut_sdk_modules "")
-get_target_property(_renut_rex_base rex::base IMPORTED_LOCATION_RELEASE)
-if(NOT _renut_rex_base)
-    get_target_property(_renut_rex_base rex::base IMPORTED_LOCATION)
-endif()
-if(_renut_rex_base)
-    get_filename_component(_renut_rex_lib_dir "${_renut_rex_base}" DIRECTORY)
-    file(GLOB _renut_rex_modules "${_renut_rex_lib_dir}/librex*.so")
-    foreach(_module IN LISTS _renut_rex_modules)
-        list(APPEND renut_sdk_modules --library "${_module}")
-    endforeach()
-endif()
-
 add_custom_command(
     OUTPUT "${renut_appimage}"
     ${renut_fetch_linuxdeploy}
@@ -99,7 +81,6 @@ add_custom_command(
             --executable "${renut_appdir}/usr/bin/renut"
             --deploy-deps-only "${renut_appdir}/usr/lib"
             ${renut_sentry_crash_executable}
-            ${renut_sdk_modules}
             --desktop-file "${CMAKE_SOURCE_DIR}/icon/renut.desktop"
             --icon-file "${CMAKE_SOURCE_DIR}/icon/renut.png"
             --output appimage
